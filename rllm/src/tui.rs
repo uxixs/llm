@@ -258,6 +258,10 @@ impl Style {
     pub fn red(&self, s: &str) -> String {
         self.wrap("38;5;203", s)
     }
+    /// The word still being generated: a soft red tint.
+    pub fn tint(&self, s: &str) -> String {
+        self.wrap("38;5;210", s)
+    }
 }
 
 /// Terminal columns taken by `c`: 2 for Hangul, CJK, fullwidth forms and most emoji,
@@ -333,6 +337,17 @@ impl Wrap {
         let mut out = String::new();
         self.flush_word(&mut out);
         out
+    }
+
+    /// The word held back so far, for a live preview: (columns of leading space, word,
+    /// word width). None when there is no partial word or it would not fit on this line
+    /// (it will move to the next line once complete).
+    pub fn preview(&self) -> Option<(usize, &str, usize)> {
+        if self.word.is_empty() {
+            return None;
+        }
+        let gap = usize::from(self.space);
+        (self.col + gap + self.word_w <= self.width).then_some((gap, self.word.as_str(), self.word_w))
     }
 
     fn newline(&mut self, out: &mut String) {
@@ -518,22 +533,27 @@ const HELP: &str = "\
 /quit, /exit   leave (also Ctrl+C at the prompt, or Ctrl+Z then Enter)
 Ctrl+C while the assistant is replying stops that reply.";
 
-/// One world city per letter, A to Z. Runs are named by overall rank, worst first, so the
-/// letter climbs as models get better (like Android or Ubuntu releases).
+/// City ladder from small but well-known (often for culture) to the megacities everyone
+/// knows. Weaker models get names from the bottom, stronger ones from the top.
 pub const CITIES: &[&str] = &[
-    "Amsterdam", "Busan", "Cairo", "Dublin", "Edinburgh", "Florence", "Geneva", "Helsinki",
-    "Istanbul", "Jakarta", "Kyoto", "Lisbon", "Madrid", "Nairobi", "Oslo", "Paris", "Quito", "Rome",
-    "Seoul", "Tokyo", "Ulaanbaatar", "Vienna", "Warsaw", "Xian", "Yokohama", "Zurich",
+    "Bruges", "Salzburg", "Cusco", "Reykjavik", "Marrakech", "Edinburgh", "Florence", "Venice",
+    "Kyoto", "Prague", "Vienna", "Amsterdam", "Barcelona", "Sydney", "Dubai", "Rome", "Hong Kong",
+    "Singapore", "Los Angeles", "Shanghai", "London", "Paris", "Seoul", "Tokyo", "New York",
 ];
 
-/// City for overall rank `r` (0 = worst); past Z the alphabet repeats with a number.
-pub fn city_for_rank(r: usize) -> String {
-    let base = CITIES[r % CITIES.len()];
-    if r < CITIES.len() {
-        base.to_string()
-    } else {
-        format!("{base} {}", r / CITIES.len() + 1)
+/// City for overall rank `r` (0 = worst) out of `n` runs. Ranks are spread over the whole
+/// ladder, so the worst run is always the first city and the best is always the last; past
+/// the ladder's length names repeat with a number.
+pub fn city_for_rank(r: usize, n: usize) -> String {
+    let len = CITIES.len();
+    if n > len {
+        // more runs than cities: climb one step per rank, repeating with a number
+        let base = CITIES[r * len / n];
+        let k = (0..r).filter(|&q| q * len / n == r * len / n).count();
+        return if k == 0 { base.to_string() } else { format!("{base} {}", k + 1) };
     }
+    let i = if n <= 1 { len - 1 } else { (r * (len - 1) + (n - 1) / 2) / (n - 1) };
+    CITIES[i.min(len - 1)].to_string()
 }
 
 /// Overall rank of each run from its `major.minor` version: worst (lowest) is 0.
@@ -670,9 +690,10 @@ pub fn list_runs(dir: &Path) -> Vec<RunInfo> {
         .collect();
     let versions = assign_versions(&inputs);
     let ranks = overall_ranks(&versions);
+    let n = runs.len();
     for ((r, v), k) in runs.iter_mut().zip(versions).zip(ranks) {
         r.version = v;
-        r.codename = city_for_rank(k);
+        r.codename = city_for_rank(k, n);
     }
     runs
 }
@@ -688,7 +709,32 @@ pub fn fmt_age(s: u64) -> String {
 }
 
 const PICK_TITLE: &str = "✻ Choose a model";
-const ARROW_HINT: &str = "  ↑/↓ to move · Enter to start · 1-9 to jump · q or Esc to quit";
+const ARROW_HINT: &str = "  ↑/↓ move · Enter start · 1-9 jump · q quit";
+
+/// Runs whose mean validation loss is at least this are "weak" (they only print noise) and
+/// hidden from the picker unless asked for.
+pub const WEAK_LOSS: f64 = 6.0;
+
+/// Mean validation loss of at least `WEAK_LOSS`, or no losses recorded at all.
+pub fn is_weak(r: &RunInfo) -> bool {
+    let v: Vec<f64> = [r.val_pre, r.val_sft].into_iter().flatten().collect();
+    v.is_empty() || v.iter().sum::<f64>() / v.len() as f64 >= WEAK_LOSS
+}
+
+/// Indices of the runs to list: all of them, or only the non-weak ones (all, if every run
+/// is weak).
+pub fn visible_runs(runs: &[RunInfo], show_all: bool) -> Vec<usize> {
+    let v: Vec<usize> = (0..runs.len()).filter(|&i| show_all || !is_weak(&runs[i])).collect();
+    if v.is_empty() {
+        (0..runs.len()).collect()
+    } else {
+        v
+    }
+}
+
+fn subset(runs: &[RunInfo], idx: &[usize]) -> Vec<RunInfo> {
+    idx.iter().map(|&i| runs[i].clone()).collect()
+}
 
 /// One line per run, the selected one marked with a red `❯` and its name in bold.
 pub fn fmt_run_rows(style: &Style, runs: &[RunInfo], sel: usize) -> String {
@@ -731,6 +777,8 @@ pub enum Key {
     End,
     Enter,
     Digit(u8),
+    /// Show or hide weak models (`h`).
+    Toggle,
     Quit,
     Other,
 }
@@ -762,6 +810,7 @@ pub fn parse_keys(b: &[u8]) -> Vec<Key> {
             b'\r' | b'\n' => Key::Enter,
             b'k' => Key::Up,
             b'j' => Key::Down,
+            b'h' | b'H' => Key::Toggle,
             c @ b'1'..=b'9' => Key::Digit(c - b'0'),
             _ => Key::Other,
         });
@@ -799,20 +848,30 @@ impl Picker {
 }
 
 /// Arrow-key picker: draws the list, redraws it in place as the selection moves, and
-/// returns the choice. Ok(None) on quit or end of input. `input` must deliver keys one at
-/// a time (console in raw mode).
+/// returns the chosen index into `runs`. Weak models are hidden until `h` is pressed.
+/// Ok(None) on quit or end of input. `input` must deliver keys one at a time (console in
+/// raw mode).
 pub fn pick_run_keys(
     runs: &[RunInfo],
     input: &mut dyn std::io::Read,
     out: &mut dyn Write,
     style: &Style,
 ) -> std::io::Result<Option<usize>> {
-    let mut p = Picker::new(runs.len());
-    let draw = |out: &mut dyn Write, sel: usize| -> std::io::Result<()> {
-        write!(out, "{}\n{}\n", fmt_run_rows(style, runs, sel), style.dim(ARROW_HINT))
+    let mut show_all = false;
+    let mut vis = visible_runs(runs, show_all);
+    let weak = runs.len() - visible_runs(runs, false).len();
+    let mut p = Picker::new(vis.len());
+    let draw = |out: &mut dyn Write, vis: &[usize], sel: usize, show_all: bool| -> std::io::Result<()> {
+        let extra = match (weak, show_all) {
+            (0, _) => String::new(),
+            (_, true) => " · h hide weak".to_string(),
+            (n, false) => format!(" · h show {n} weak"),
+        };
+        let hint = style.dim(&format!("{ARROW_HINT}{extra}"));
+        write!(out, "{}\n{hint}\n", fmt_run_rows(style, &subset(runs, vis), sel))
     };
     write!(out, "{}\n\n\x1b[?25l", style.accent(PICK_TITLE))?; // hide the cursor
-    draw(out, p.sel)?;
+    draw(out, &vis, p.sel, show_all)?;
     let mut buf = [0u8; 64];
     let result = loop {
         out.flush()?;
@@ -820,18 +879,26 @@ pub fn pick_run_keys(
         if n == 0 {
             break None;
         }
-        let before = p.sel;
+        let (before, rows_before) = (p.sel, vis.len());
+        let mut changed = false;
         let mut done = None;
         for k in parse_keys(&buf[..n]) {
+            if k == Key::Toggle && weak > 0 {
+                show_all = !show_all;
+                vis = visible_runs(runs, show_all);
+                p = Picker::new(vis.len());
+                changed = true;
+                continue;
+            }
             if let Some(r) = p.apply(k) {
-                done = Some(r);
+                done = Some(r.map(|i| vis[i]));
                 break;
             }
         }
-        if p.sel != before {
+        if changed || p.sel != before {
             // back to the first row (rows + blank + hint), clear, redraw
-            write!(out, "\x1b[{}A\r\x1b[J", runs.len() + 2)?;
-            draw(out, p.sel)?;
+            write!(out, "\x1b[{}A\r\x1b[J", rows_before + 2)?;
+            draw(out, &vis, p.sel, show_all)?;
         }
         if let Some(r) = done {
             break r;
@@ -869,15 +936,20 @@ pub fn parse_choice(line: &str, n: usize) -> Result<Option<usize>, String> {
     }
 }
 
-/// Shows the picker on `out` and reads answers from `input` until one is valid.
-/// Ok(None) when the user quits or input ends.
+/// Shows the picker on `out` and reads answers from `input` until one is valid; weak
+/// models are left out. Returns an index into `runs`; Ok(None) when the user quits or
+/// input ends.
 pub fn pick_run(
     runs: &[RunInfo],
     input: &mut dyn BufRead,
     out: &mut dyn Write,
     style: &Style,
 ) -> std::io::Result<Option<usize>> {
-    write!(out, "{}", fmt_run_menu(style, runs))?;
+    let vis = visible_runs(runs, false);
+    write!(out, "{}", fmt_run_menu(style, &subset(runs, &vis)))?;
+    if vis.len() < runs.len() {
+        writeln!(out, "{}", style.dim(&format!("  {} weak models hidden (use --model to pick one)", runs.len() - vis.len())))?;
+    }
     let mut line = String::new();
     loop {
         write!(out, "{} ", style.accent(">"))?;
@@ -886,10 +958,10 @@ pub fn pick_run(
         if input.read_line(&mut line)? == 0 {
             return Ok(None);
         }
-        match parse_choice(&line, runs.len()) {
+        match parse_choice(&line, vis.len()) {
             Ok(c) => {
                 writeln!(out)?;
-                return Ok(c);
+                return Ok(c.map(|i| vis[i]));
             }
             Err(e) => writeln!(out, "{}", note(style, &e, true))?,
         }
@@ -999,7 +1071,17 @@ impl Chat {
         let mut stepper = |tok: u16, pos: usize| step(params, cfg, be, cache, tok, pos);
         let (reply, secs) = {
             let mut emit = |s: &str| {
-                out.write_all(wrap.push(s).as_bytes())?;
+                if style.color {
+                    // erase the last preview, print what is settled, then show the word still
+                    // being generated in red and step back over it (it is redrawn next time)
+                    out.write_all(b"\x1b[K")?;
+                    out.write_all(wrap.push(s).as_bytes())?;
+                    if let Some((gap, word, w)) = wrap.preview() {
+                        write!(out, "{}{}\x1b[{}D", " ".repeat(gap), style.tint(word), gap + w)?;
+                    }
+                } else {
+                    out.write_all(wrap.push(s).as_bytes())?;
+                }
                 out.flush()
             };
             generate_cancellable(
@@ -1013,6 +1095,9 @@ impl Chat {
                 &mut emit,
             )?
         };
+        if style.color {
+            out.write_all(b"\x1b[K")?; // drop the red preview; the last word prints normally
+        }
         out.write_all(wrap.finish().as_bytes())?;
         let stopped = cancel.swap(false, Relaxed);
         writeln!(out)?;
@@ -1265,7 +1350,7 @@ mod tests {
         // no tokenizer files: one family; "mid" has no losses so it ranks worst,
         // then old (4.5), then new (3.455) is best
         let titles: Vec<String> = runs.iter().map(|r| format!("{} {}", r.codename, r.version)).collect();
-        assert_eq!(titles, ["Cairo 1.2", "Amsterdam 1.0", "Busan 1.1"]);
+        assert_eq!(titles, ["New York 1.2", "Bruges 1.0", "Barcelona 1.1"]);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1284,12 +1369,23 @@ mod tests {
         assert_eq!(got, ["1.0", "1.2", "2.1", "2.2", "2.0", "1.1"]);
         let ranks = overall_ranks(&got);
         assert_eq!(ranks, [0, 2, 4, 5, 3, 1]);
-        assert_eq!(city_for_rank(0), "Amsterdam");
-        assert_eq!(city_for_rank(7), "Helsinki");
-        assert_eq!(city_for_rank(26), "Amsterdam 2");
-        for (i, c) in CITIES.iter().enumerate() {
-            assert_eq!(c.as_bytes()[0], b'A' + i as u8, "{c} out of alphabetical order");
+        // worst is always the smallest city, best always New York, whatever the count
+        for n in [1usize, 2, 3, 9, 25] {
+            let names: Vec<String> = (0..n).map(|r| city_for_rank(r, n)).collect();
+            assert_eq!(names.last().unwrap(), "New York", "n={n}");
+            if n > 1 {
+                assert_eq!(names[0], "Bruges", "n={n}");
+            }
+            let set: std::collections::HashSet<&String> = names.iter().collect();
+            assert_eq!(set.len(), n, "names unique for n={n}: {names:?}");
         }
+        // more runs than cities: still unique and still climbing
+        let names: Vec<String> = (0..60).map(|r| city_for_rank(r, 60)).collect();
+        let set: std::collections::HashSet<&String> = names.iter().collect();
+        assert_eq!(set.len(), 60);
+        assert!(names[0].starts_with("Bruges") && names[59].starts_with("New York"), "{names:?}");
+        let all: std::collections::HashSet<&str> = CITIES.iter().copied().collect();
+        assert_eq!(all.len(), CITIES.len(), "no duplicate cities");
     }
 
     #[test]
@@ -1349,6 +1445,50 @@ mod tests {
         ]
     }
 
+    fn run(code: &str, pre: Option<f64>, sft: Option<f64>) -> RunInfo {
+        RunInfo {
+            codename: code.into(),
+            version: "1.0".into(),
+            name: code.to_lowercase(),
+            model: format!("runs/{code}/model.bin").into(),
+            age_s: 1,
+            val_pre: pre,
+            val_sft: sft,
+        }
+    }
+
+    #[test]
+    fn weak_models_hidden_until_toggled() {
+        let runs = vec![
+            run("Good", Some(2.5), Some(3.2)),
+            run("Noise", Some(6.3), Some(6.9)),
+            run("Okay", Some(4.0), Some(3.7)),
+            run("Empty", None, None),
+        ];
+        assert!(!is_weak(&runs[0]) && is_weak(&runs[1]) && !is_weak(&runs[2]) && is_weak(&runs[3]));
+        assert_eq!(visible_runs(&runs, false), [0, 2]);
+        assert_eq!(visible_runs(&runs, true), [0, 1, 2, 3]);
+        let s = Style { color: false };
+        // down, Enter: second visible row = "Okay" (index 2 in the full list)
+        let mut out = Vec::new();
+        let mut input = std::io::Cursor::new(b"\x1b[B\r".to_vec());
+        assert_eq!(pick_run_keys(&runs, &mut input, &mut out, &s).unwrap(), Some(2));
+        let shown = String::from_utf8(out).unwrap();
+        assert!(!shown.contains("Noise") && shown.contains("h show 2 weak"), "{shown}");
+        // h shows all four, then down, Enter picks "Noise" (index 1)
+        let mut out = Vec::new();
+        let mut input = std::io::Cursor::new(b"h\x1b[B\r".to_vec());
+        assert_eq!(pick_run_keys(&runs, &mut input, &mut out, &s).unwrap(), Some(1));
+        let shown = String::from_utf8(out).unwrap();
+        assert!(shown.contains("Noise") && shown.contains("h hide weak"), "{shown}");
+        assert!(shown.contains("\x1b[4A"), "toggle redraw moves up the old 2 rows + 2: {shown:?}");
+        // number picker: only visible runs, numbers map back to the full list
+        let mut out = Vec::new();
+        let mut input = std::io::Cursor::new(b"2\n".to_vec());
+        assert_eq!(pick_run(&runs, &mut input, &mut out, &s).unwrap(), Some(2));
+        assert!(String::from_utf8(out).unwrap().contains("2 weak models hidden"));
+    }
+
     #[test]
     fn arrow_picker_scripted() {
         let runs = two_runs();
@@ -1386,7 +1526,7 @@ mod tests {
     fn picker_menu_and_retry() {
         let runs = vec![
             RunInfo { codename: "Istanbul".into(), version: "2.4".into(), name: "tiny-mem".into(), model: "runs/tiny-mem/model.bin".into(), age_s: 90, val_pre: Some(2.56), val_sft: Some(3.2) },
-            RunInfo { codename: "Dublin".into(), version: "1.3".into(), name: "reddit".into(), model: "runs/reddit/model.bin".into(), age_s: 7200, val_pre: None, val_sft: None },
+            RunInfo { codename: "Dublin".into(), version: "1.3".into(), name: "reddit".into(), model: "runs/reddit/model.bin".into(), age_s: 7200, val_pre: Some(4.03), val_sft: Some(3.75) },
         ];
         let s = Style { color: false };
         let menu = fmt_run_menu(&s, &runs);
@@ -1473,6 +1613,40 @@ mod tests {
             assert!(str_width(line) <= 8, "{line:?}");
         }
         assert_eq!(s.replace(['\n', ' '], ""), "가나다라마");
+    }
+
+    #[test]
+    fn wrap_preview_shows_partial_word() {
+        let mut w = Wrap::new(20, 2, 2);
+        assert_eq!(w.push("Hel"), "");
+        assert_eq!(w.preview(), Some((0, "Hel", 3)));
+        assert_eq!(w.push("lo wor"), "Hello");
+        assert_eq!(w.preview(), Some((1, "wor", 3)), "space before the partial word");
+        assert_eq!(w.push("ld "), " world");
+        assert_eq!(w.preview(), None, "nothing pending after a space");
+        // a word that will not fit on this line gets no preview
+        let mut w = Wrap::new(10, 2, 2);
+        w.push("abcde ");
+        w.push("fgh");
+        assert_eq!(w.preview(), None);
+    }
+
+    #[test]
+    fn colour_turn_tints_partial_word() {
+        let (dir, model, tok) = tiny_files("tint", 9);
+        let mut chat = Chat::load(args(model, tok)).unwrap();
+        let mut out = Vec::new();
+        chat.turn(&mut out, &Style { color: true }, "hello", &AtomicBool::new(false)).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("\x1b[K"), "previews are erased: {out:?}");
+        if out.contains("\x1b[38;5;210m") {
+            assert!(out.contains("D"), "cursor steps back over the preview");
+        }
+        // plain mode: no escapes at all
+        let mut plain = Vec::new();
+        chat.turn(&mut plain, &Style { color: false }, "hello", &AtomicBool::new(false)).unwrap();
+        assert!(!String::from_utf8(plain).unwrap().contains('\x1b'));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
