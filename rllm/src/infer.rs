@@ -313,8 +313,10 @@ impl ChatArgs {
 }
 
 /// Generate a reply to `prompt` (positions restart at 0; the cache is overwritten), streaming
-/// decoded text to `on_text`. Stops at `<|end|>` or when the context is full. Returns the reply
-/// tokens (without `<|end|>`) and the seconds spent generating (excluding prefill).
+/// decoded text to `on_text`. Stops at any special token (`<|end|>`, and also `<|user|>` /
+/// `<|assistant|>`, so the model cannot run on into a made-up next turn) or when the context
+/// is full. Specials are neither printed nor returned. Returns the reply tokens and the
+/// seconds spent generating (excluding prefill).
 #[allow(clippy::too_many_arguments)]
 fn generate(
     p: &Params,
@@ -326,16 +328,30 @@ fn generate(
     rng: &mut Rng,
     on_text: &mut dyn FnMut(&str) -> std::io::Result<()>,
 ) -> std::io::Result<(Vec<u16>, f64)> {
-    let be = args.backend;
+    let mut stepper = |tok: u16, pos: usize| step(p, cfg, args.backend, cache, tok, pos);
+    generate_with(&mut stepper, cfg.ctx, args, bpe, prompt, rng, on_text)
+}
+
+/// `generate` over an arbitrary `(token, pos) -> logits` stepper (a stub in tests).
+fn generate_with(
+    stepper: &mut dyn FnMut(u16, usize) -> Vec<f32>,
+    ctx: usize,
+    args: &ChatArgs,
+    bpe: &Bpe,
+    prompt: &[u16],
+    rng: &mut Rng,
+    on_text: &mut dyn FnMut(&str) -> std::io::Result<()>,
+) -> std::io::Result<(Vec<u16>, f64)> {
     let mut logits = Vec::new();
     for (pos, &t) in prompt.iter().enumerate() {
-        logits = step(p, cfg, be, cache, t, pos);
+        logits = stepper(t, pos);
     }
     let t0 = Instant::now();
     let (mut pos, mut reply, mut dec) = (prompt.len(), Vec::new(), StreamDecoder::new());
-    while pos < cfg.ctx {
+    let specials = [bpe.user(), bpe.assistant(), bpe.end()];
+    while pos < ctx {
         let tok = sample(&logits, args.temp, args.top_p, rng);
-        if tok == bpe.end() {
+        if specials.contains(&tok) {
             break;
         }
         reply.push(tok);
@@ -343,7 +359,7 @@ fn generate(
         if !text.is_empty() {
             on_text(&text)?;
         }
-        logits = step(p, cfg, be, cache, tok, pos);
+        logits = stepper(tok, pos);
         pos += 1;
     }
     let tail = dec.flush();
@@ -370,8 +386,16 @@ pub fn run_chat(
     if args.kernel == Kernel::Ternary {
         return Err("--kernel ternary is not implemented yet (planned for the ternary-kernel task)".into());
     }
-    let (cfg, params) = Params::load(&args.model).map_err(io)?;
-    let bpe = Bpe::load(&args.tokenizer).map_err(io)?;
+    // `Params::load` already names the file in its format errors; add it for the rest.
+    let (cfg, params) = Params::load(&args.model).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::InvalidData {
+            e.to_string()
+        } else {
+            format!("{}: {e}", args.model.display())
+        }
+    })?;
+    let bpe = Bpe::load(&args.tokenizer)
+        .map_err(|e| format!("{}: {e}", args.tokenizer.display()))?;
     if bpe.vocab.len() != cfg.vocab {
         return Err(format!(
             "tokenizer has {} tokens but the model expects {}",
@@ -509,6 +533,57 @@ mod tests {
         for _ in 0..100 {
             assert_eq!(sample(&logits, 1.0, 0.5, &mut rng), 0);
         }
+    }
+
+    #[test]
+    fn top_p_keeps_threshold_crossing_token() {
+        // probs [0.4, 0.4, 0.2], top_p 0.5: keep the first two, never the third.
+        let logits = [0.4f32.ln(), 0.4f32.ln(), 0.2f32.ln()];
+        let mut rng = Rng::new(4);
+        let mut seen = [false; 3];
+        for _ in 0..200 {
+            seen[sample(&logits, 1.0, 0.5, &mut rng) as usize] = true;
+        }
+        assert_eq!(seen, [true, true, false]);
+    }
+
+    #[test]
+    fn generation_stops_on_any_special() {
+        let bpe = bpe300();
+        let a = args(PathBuf::new(), PathBuf::new());
+        for special in [bpe.user(), bpe.assistant(), bpe.end()] {
+            let prompt = [bpe.user(), 104, bpe.assistant()];
+            let mut calls = 0;
+            // Two ordinary tokens ('A'), then the forced special.
+            let mut stepper = |_t: u16, _pos: usize| {
+                calls += 1;
+                let mut l = vec![0.0f32; 300];
+                l[if calls <= prompt.len() + 1 { 65 } else { special as usize }] = 10.0;
+                l
+            };
+            let mut text = String::new();
+            let mut emit = |s: &str| {
+                text.push_str(s);
+                Ok(())
+            };
+            let (reply, _) =
+                generate_with(&mut stepper, 128, &a, &bpe, &prompt, &mut Rng::new(1), &mut emit).unwrap();
+            assert_eq!(reply, [65, 65], "special {special}");
+            assert_eq!(text, "AA", "special {special}");
+        }
+    }
+
+    #[test]
+    fn missing_files_name_their_path() {
+        let a = args(PathBuf::from("no_such_dir/model.bin"), PathBuf::from("no_such_dir/tok.bin"));
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let e = run_chat(&a, &mut std::io::empty(), &mut out, &mut err).unwrap_err();
+        assert!(e.contains("no_such_dir") && e.contains("model.bin"), "{e}");
+        let (dir, model, _) = tiny_files("badtok", false);
+        let a = args(model, dir.join("missing_tok.bin"));
+        let e = run_chat(&a, &mut std::io::empty(), &mut out, &mut err).unwrap_err();
+        assert!(e.contains("missing_tok.bin"), "{e}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
