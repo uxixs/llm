@@ -49,6 +49,30 @@ impl PretrainBatcher {
         self.tokens.is_empty()
     }
 
+    /// Number of non-overlapping sequential windows of `t+1` tokens.
+    pub fn num_windows(&self, t: usize) -> usize {
+        self.tokens.len() / (t + 1)
+    }
+
+    /// Deterministic validation batch: row i is window `start_window + i`, i.e. tokens
+    /// `[w*(t+1) .. w*(t+1)+t+1)`; inputs are the first `t`, targets the next `t`, extra 0.
+    /// Rows past the end of the data are zero tokens with mask 0.
+    pub fn window_batch(&self, start_window: usize, b: usize, t: usize) -> Batch {
+        let w = t + 1;
+        let mut inputs = vec![0u16; b * t];
+        let mut targets = vec![0u16; b * t];
+        let mut mask = vec![0.0; b * t];
+        for r in 0..b {
+            let s = (start_window + r) * w;
+            if s + w <= self.tokens.len() {
+                inputs[r * t..(r + 1) * t].copy_from_slice(&self.tokens[s..s + t]);
+                targets[r * t..(r + 1) * t].copy_from_slice(&self.tokens[s + 1..s + w]);
+                mask[r * t..(r + 1) * t].fill(1.0);
+            }
+        }
+        Batch { b, t, extra: 0, inputs, targets, mask }
+    }
+
     /// `b` random windows of `t+1+extra` tokens.
     pub fn next(&mut self, rng: &mut Rng, b: usize, t: usize, extra: usize) -> Batch {
         let w = t + 1 + extra;
@@ -124,6 +148,32 @@ impl SftBatcher {
 
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
+    }
+
+    /// Deterministic validation batch: row i is record `start + i`, padded and masked
+    /// exactly as `next` (extra 0). Rows past the last record are fully masked.
+    pub fn records_batch(&self, start: usize, b: usize, t: usize) -> Batch {
+        let mut inputs = Vec::with_capacity(b * t);
+        let mut targets = Vec::with_capacity(b * t);
+        let mut mask = Vec::with_capacity(b * t);
+        for r in 0..b {
+            match self.records.get(start + r) {
+                Some(rec) => {
+                    let m = sft_mask(rec, self.assistant, self.end);
+                    for j in 0..t {
+                        inputs.push(rec.get(j).copied().unwrap_or(self.end));
+                        targets.push(rec.get(j + 1).copied().unwrap_or(self.end));
+                        mask.push(m.get(j).copied().unwrap_or(0.0));
+                    }
+                }
+                None => {
+                    inputs.extend(std::iter::repeat(self.end).take(t));
+                    targets.extend(std::iter::repeat(self.end).take(t));
+                    mask.extend(std::iter::repeat(0.0).take(t));
+                }
+            }
+        }
+        Batch { b, t, extra: 0, inputs, targets, mask }
     }
 
     /// One random sample per row, right-padded with `end`; mask is 0 on padding and
@@ -234,6 +284,42 @@ mod tests {
         assert_eq!(b.inputs, vec![U, 1, A, 10]);
         assert_eq!(b.targets, vec![1, A, 10, 11]);
         assert_eq!(b.mask, vec![0.0, 0.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn window_batch_sequential_and_padded() {
+        let pb = PretrainBatcher::from_tokens((0..20).collect());
+        // t=4 -> windows of 5 tokens; 4 full windows exist
+        let b = pb.window_batch(1, 2, 4);
+        assert_eq!(b.inputs, vec![5, 6, 7, 8, 10, 11, 12, 13]);
+        assert_eq!(b.targets, vec![6, 7, 8, 9, 11, 12, 13, 14]);
+        assert_eq!((b.extra, b.mask.len()), (0, 8));
+        assert!(b.mask.iter().all(|&m| m == 1.0));
+        // window 3 is the last full one; window 4 does not exist -> masked row
+        let b = pb.window_batch(3, 2, 4);
+        assert_eq!(&b.inputs[..4], &[15, 16, 17, 18]);
+        assert_eq!(&b.mask[..4], &[1.0; 4]);
+        assert_eq!(&b.mask[4..], &[0.0; 4]);
+        assert_eq!(b.inputs.len(), 8);
+        assert_eq!(pb.num_windows(4), 4);
+    }
+
+    #[test]
+    fn records_batch_matches_next_padding() {
+        let r0 = vec![U, 1, 2, A, 10, 11, E];
+        let r1 = vec![U, 3, A, 12, E];
+        let sb = SftBatcher::from_records(vec![r0.clone(), r1.clone()], A, E);
+        let b = sb.records_batch(0, 3, 8);
+        assert_eq!(&b.inputs[..7], &r0[..]);
+        assert_eq!(b.inputs[7], E);
+        assert_eq!(&b.targets[..6], &r0[1..]);
+        assert_eq!(&b.mask[..8], &[0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0]);
+        assert_eq!(&b.mask[8..16], &[0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]);
+        // third row does not exist: fully masked
+        assert!(b.mask[16..].iter().all(|&m| m == 0.0));
+        assert_eq!(b.mask.len(), 24);
+        let b = sb.records_batch(1, 1, 8);
+        assert_eq!(&b.inputs[..5], &r1[..]);
     }
 
     #[test]

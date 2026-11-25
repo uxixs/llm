@@ -8,3 +8,4 @@ pub mod rng;
 pub mod ops;
 #[cfg(test)]
 mod gradcheck;
+pub mod train;
