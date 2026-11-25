@@ -1,0 +1,760 @@
+//! AVX-512 matmul and attention kernels (single-threaded). Same signatures and
+//! semantics as `ops::scalar`. Requires avx512f only (masked loads/stores, FMA,
+//! horizontal reduce); each public fn asserts it at runtime.
+//!
+//! # Matmul microkernel
+//! All three products are one GEMM shape, C[rows x cols] (+)= A[rows x depth] .
+//! B[depth x cols], where each B row is contiguous along `cols`:
+//! - fwd: C=out, A=x, B=W^T packed into 64-column panels (`pack_wt`).
+//! - dx:  C=dx,  A=dout, B=w as-is (w[j, p..] is contiguous in p).
+//! - dw:  C=dw,  A=dout^T (strided scalar reads of dout), B=x as-is.
+//!
+//! The microkernel keeps an `MR x NV` = 6 x 4 tile of zmm accumulators (6 rows
+//! x 64 cols, 24 regs) plus 4 B vectors and 1 broadcast A value: 29 of the 32
+//! zmm registers. Per depth step: 4 loads, 6 broadcasts, 24 FMAs, so the single
+//! 512-bit FMA port, not the load ports, is the limit. Column tails use masked
+//! loads/stores (masked-off lanes are never accessed); row tails use the same
+//! kernel instantiated with MR = 1..5.
+//!
+//! Blocking: depth in chunks of `DB` (a 256 x 64 B slice is 64 KB, reused from
+//! L2 across a row block), rows in blocks of `IB`. C is loaded into the
+//! accumulators for every depth chunk after the first (and for the first when
+//! the op accumulates), so depth blocking needs no extra scratch.
+//!
+//! # Row ranges (for multithreading)
+//! `matmul_fwd_rows`, `matmul_bwd_dx_rows` and `matmul_bwd_dw_rows` work on a
+//! contiguous row range of `out` / `dx` / `dw`, so a caller can hand disjoint
+//! `chunks_mut` to threads. `matmul_fwd` packs W into a thread-local buffer; a
+//! parallel caller should `pack_wt` once and share the panels read-only.
+//! Attention splits by batch: out, att, qkv, dout and dqkv for batches b0..b1
+//! are contiguous sub-slices, so `attn_fwd` / `attn_bwd` can be called on them
+//! directly.
+//!
+//! # Scratch
+//! `matmul_fwd` reuses a `thread_local!` pack buffer (grows to the largest
+//! `packed_len` seen, never shrinks). `attn_bwd` reuses a `thread_local!`
+//! length-t buffer for dp/ds. No per-call heap allocation after warm-up.
+#![warn(unsafe_op_in_unsafe_fn)]
+
+use std::arch::x86_64::*;
+use std::cell::RefCell;
+
+/// f32 lanes per zmm.
+const L: usize = 16;
+/// zmm vectors per microkernel row.
+const NV: usize = 4;
+/// Columns per microkernel tile = packed panel width.
+const NR: usize = NV * L;
+/// Rows per microkernel tile.
+const MR: usize = 6;
+/// Depth chunk.
+const DB: usize = 256;
+/// Row block (a multiple of MR).
+const IB: usize = 96;
+
+fn require_avx512() {
+    assert!(
+        is_x86_feature_detected!("avx512f"),
+        "ops::avx512 requires a CPU with AVX-512F (avx512f not detected)"
+    );
+}
+
+/// Mask with the low `min(len, 16)` lanes set.
+#[inline(always)]
+fn tail_mask(len: usize) -> __mmask16 {
+    if len >= L {
+        0xFFFF
+    } else {
+        ((1u32 << len) - 1) as __mmask16
+    }
+}
+
+thread_local! {
+    static PACK: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+    static DS: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+}
+
+// ---------------------------------------------------------------- matmul
+
+/// Length of the packed W^T buffer that `pack_wt` fills.
+pub fn packed_len(k: usize, m: usize) -> usize {
+    m.div_ceil(NR) * NR * k
+}
+
+/// Packs w[m x k] into panels of NR columns: panel `jb` holds, for each p in
+/// 0..k, the NR values w[jb*NR + jj, p] (zero past m).
+pub fn pack_wt(packed: &mut [f32], w: &[f32], k: usize, m: usize) {
+    assert_eq!(w.len(), m * k);
+    assert_eq!(packed.len(), packed_len(k, m));
+    if k == 0 {
+        return;
+    }
+    for (jb, panel) in packed.chunks_exact_mut(NR * k).enumerate() {
+        for (p, dst) in panel.as_chunks_mut::<NR>().0.iter_mut().enumerate() {
+            for (jj, d) in dst.iter_mut().enumerate() {
+                let j = jb * NR + jj;
+                *d = if j < m { w[j * k + p] } else { 0.0 };
+            }
+        }
+    }
+}
+
+/// C[R x ncols] (+)= sum_p A[r, p] * B[p, 0..ncols], with ncols <= NR.
+/// A[r, p] = *a.add(r*a_rs + p*a_cs); B row p starts at b.add(p*b_rs);
+/// C row r starts at c.add(r*c_rs). If `acc_in`, C is read first, else overwritten.
+///
+/// # Safety
+/// avx512f is available; for all r < R, p < depth, col < ncols the A, B and C
+/// elements above lie inside their allocations; C does not overlap A or B.
+#[target_feature(enable = "avx512f")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn micro<const R: usize>(
+    a: *const f32,
+    a_rs: usize,
+    a_cs: usize,
+    b: *const f32,
+    b_rs: usize,
+    c: *mut f32,
+    c_rs: usize,
+    depth: usize,
+    ncols: usize,
+    acc_in: bool,
+) {
+    // Vectors past ncols get mask 0 and offset 0, so their (in-bounds) pointer
+    // touches no memory.
+    let mut mask = [0 as __mmask16; NV];
+    let mut voff = [0usize; NV];
+    for v in 0..NV {
+        let lanes = ncols.saturating_sub(v * L);
+        if lanes > 0 {
+            mask[v] = tail_mask(lanes);
+            voff[v] = v * L;
+        }
+    }
+    let mut acc = [[_mm512_setzero_ps(); NV]; R];
+    if acc_in {
+        for (r, accr) in acc.iter_mut().enumerate() {
+            for v in 0..NV {
+                // SAFETY: C row r is in bounds for cols < ncols; lanes at or
+                // past ncols are masked off and not accessed.
+                accr[v] = unsafe { _mm512_maskz_loadu_ps(mask[v], c.add(r * c_rs + voff[v])) };
+            }
+        }
+    }
+    for p in 0..depth {
+        let mut bv = [_mm512_setzero_ps(); NV];
+        for v in 0..NV {
+            // SAFETY: B row p is in bounds for cols < ncols; other lanes masked.
+            bv[v] = unsafe { _mm512_maskz_loadu_ps(mask[v], b.add(p * b_rs + voff[v])) };
+        }
+        for (r, accr) in acc.iter_mut().enumerate() {
+            // SAFETY: A[r, p] is in bounds by the caller contract.
+            let av = _mm512_set1_ps(unsafe { *a.add(r * a_rs + p * a_cs) });
+            for v in 0..NV {
+                accr[v] = _mm512_fmadd_ps(av, bv[v], accr[v]);
+            }
+        }
+    }
+    for (r, accr) in acc.iter().enumerate() {
+        for v in 0..NV {
+            // SAFETY: as for the C load; masked-off lanes are not written.
+            unsafe { _mm512_mask_storeu_ps(c.add(r * c_rs + voff[v]), mask[v], accr[v]) };
+        }
+    }
+}
+
+/// Blocked driver: C[rows x cols] (+)= A[rows x depth] . B[depth x cols].
+/// Column block `cb` (cols cb*NR..) of B starts at b.add(cb*b_blk); its row p
+/// at a further p*b_rs.
+///
+/// # Safety
+/// avx512f is available; every A[i, p], B(p, col) and C[i, col] for i < rows,
+/// p < depth, col < cols is in bounds under the addressing of `micro` and the
+/// block stride above; C does not overlap A or B. Requires depth > 0 when
+/// `acc_in` is false (otherwise C would not be written).
+#[target_feature(enable = "avx512f")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn gemm(
+    c: *mut f32,
+    c_rs: usize,
+    rows: usize,
+    cols: usize,
+    a: *const f32,
+    a_rs: usize,
+    a_cs: usize,
+    b: *const f32,
+    b_rs: usize,
+    b_blk: usize,
+    depth: usize,
+    acc_in: bool,
+) {
+    let mut d0 = 0;
+    while d0 < depth {
+        let dl = DB.min(depth - d0);
+        let acc = acc_in || d0 > 0;
+        let mut i0 = 0;
+        while i0 < rows {
+            let i1 = (i0 + IB).min(rows);
+            for cb in 0..cols.div_ceil(NR) {
+                let j0 = cb * NR;
+                let nc = NR.min(cols - j0);
+                // SAFETY (this block): i + tile rows <= i1 <= rows, d0 + dl <=
+                // depth and j0 + nc <= cols, so each offset stays inside its
+                // operand and every element `micro` touches is one the caller
+                // guarantees in bounds.
+                unsafe {
+                    let bp = b.add(cb * b_blk + d0 * b_rs);
+                    let mut i = i0;
+                    macro_rules! tile {
+                        ($r:literal) => {{
+                            let ap = a.add(i * a_rs + d0 * a_cs);
+                            let cp = c.add(i * c_rs + j0);
+                            micro::<$r>(ap, a_rs, a_cs, bp, b_rs, cp, c_rs, dl, nc, acc);
+                        }};
+                    }
+                    while i + MR <= i1 {
+                        tile!(6);
+                        i += MR;
+                    }
+                    match i1 - i {
+                        0 => {}
+                        1 => tile!(1),
+                        2 => tile!(2),
+                        3 => tile!(3),
+                        4 => tile!(4),
+                        _ => tile!(5),
+                    }
+                }
+            }
+            i0 = i1;
+        }
+        d0 += dl;
+    }
+}
+
+/// out[rows x m] = x[rows x k] . W^T, with W packed by `pack_wt` (overwrites).
+/// Works on any contiguous row range of the full product: pass those x rows.
+pub fn matmul_fwd_rows(
+    out: &mut [f32],
+    x: &[f32],
+    packed: &[f32],
+    rows: usize,
+    k: usize,
+    m: usize,
+) {
+    require_avx512();
+    assert_eq!(out.len(), rows * m);
+    assert_eq!(x.len(), rows * k);
+    assert_eq!(packed.len(), packed_len(k, m));
+    if k == 0 {
+        out.fill(0.0);
+        return;
+    }
+    // SAFETY: avx512f checked, depth k > 0. A=x: (i, p) -> i*k + p < rows*k.
+    // B=packed: panel cb, row p, col jj -> cb*NR*k + p*NR + jj < packed_len.
+    // C=out: i*m + j < rows*m; out is a distinct &mut, so no overlap.
+    unsafe {
+        gemm(
+            out.as_mut_ptr(),
+            m,
+            rows,
+            m,
+            x.as_ptr(),
+            k,
+            1,
+            packed.as_ptr(),
+            NR,
+            NR * k,
+            k,
+            false,
+        )
+    };
+}
+
+/// dx[rows x k] += dout[rows x m] . w[m x k], for a contiguous row range of dx
+/// (pass the matching dout rows).
+pub fn matmul_bwd_dx_rows(
+    dx: &mut [f32],
+    dout: &[f32],
+    w: &[f32],
+    rows: usize,
+    k: usize,
+    m: usize,
+) {
+    require_avx512();
+    assert_eq!(dx.len(), rows * k);
+    assert_eq!(dout.len(), rows * m);
+    assert_eq!(w.len(), m * k);
+    // SAFETY: avx512f checked. A=dout: (i, j) -> i*m + j < rows*m. B=w: block
+    // cb starts at col cb*NR, (j, p) -> j*k + p < m*k. C=dx: i*k + p < rows*k.
+    unsafe {
+        gemm(
+            dx.as_mut_ptr(),
+            k,
+            rows,
+            k,
+            dout.as_ptr(),
+            m,
+            1,
+            w.as_ptr(),
+            k,
+            NR,
+            m,
+            true,
+        )
+    };
+}
+
+/// dw[j0..j0+rows, :] += dout[:, j0..j0+rows]^T . x. `dw` is only that row
+/// range (rows*k values); `dout` [n x m] and `x` [n x k] are full.
+#[allow(clippy::too_many_arguments)]
+pub fn matmul_bwd_dw_rows(
+    dw: &mut [f32],
+    j0: usize,
+    rows: usize,
+    dout: &[f32],
+    x: &[f32],
+    n: usize,
+    k: usize,
+    m: usize,
+) {
+    require_avx512();
+    assert!(
+        j0 + rows <= m,
+        "dw rows {j0}..{} out of range for m={m}",
+        j0 + rows
+    );
+    assert_eq!(dw.len(), rows * k);
+    assert_eq!(dout.len(), n * m);
+    assert_eq!(x.len(), n * k);
+    if rows == 0 || n == 0 {
+        return;
+    }
+    // SAFETY: avx512f checked; n > 0 and j0 < m, so dout.add(j0) is in bounds.
+    // A[r, i] = dout[j0 + r + i*m] <= (m-1) + (n-1)*m < n*m. B=x: block cb
+    // starts at col cb*NR, (i, p) -> i*k + p < n*k. C=dw: r*k + p < rows*k.
+    unsafe {
+        gemm(
+            dw.as_mut_ptr(),
+            k,
+            rows,
+            k,
+            dout.as_ptr().add(j0),
+            1,
+            m,
+            x.as_ptr(),
+            k,
+            NR,
+            n,
+            true,
+        )
+    };
+}
+
+/// out[n x m] = x[n x k] . w[m x k]^T (overwrites `out`).
+pub fn matmul_fwd(out: &mut [f32], x: &[f32], w: &[f32], n: usize, k: usize, m: usize) {
+    require_avx512();
+    assert_eq!(out.len(), n * m);
+    assert_eq!(x.len(), n * k);
+    assert_eq!(w.len(), m * k);
+    let need = packed_len(k, m);
+    PACK.with(|buf| {
+        let mut buf = buf.borrow_mut();
+        if buf.len() < need {
+            buf.resize(need, 0.0);
+        }
+        let packed = &mut buf[..need];
+        pack_wt(packed, w, k, m);
+        matmul_fwd_rows(out, x, packed, n, k, m);
+    });
+}
+
+/// dx += dout . w, dw += dout^T . x (accumulates).
+#[allow(clippy::too_many_arguments)]
+pub fn matmul_bwd(
+    dx: &mut [f32],
+    dw: &mut [f32],
+    dout: &[f32],
+    x: &[f32],
+    w: &[f32],
+    n: usize,
+    k: usize,
+    m: usize,
+) {
+    matmul_bwd_dx_rows(dx, dout, w, n, k, m);
+    matmul_bwd_dw_rows(dw, 0, m, dout, x, n, k, m);
+}
+
+// ------------------------------------------------------------- attention
+
+/// sum_j a[j]*b[j] over j < d.
+///
+/// # Safety
+/// avx512f is available; a[..d] and b[..d] are in bounds.
+#[target_feature(enable = "avx512f")]
+unsafe fn dot(a: *const f32, b: *const f32, d: usize) -> f32 {
+    let mut acc = _mm512_setzero_ps();
+    let mut j = 0;
+    while j < d {
+        let mk = tail_mask(d - j);
+        // SAFETY: lanes j..min(j+16, d) are in bounds; the rest are masked off.
+        let (va, vb) = unsafe {
+            (
+                _mm512_maskz_loadu_ps(mk, a.add(j)),
+                _mm512_maskz_loadu_ps(mk, b.add(j)),
+            )
+        };
+        acc = _mm512_fmadd_ps(va, vb, acc);
+        j += L;
+    }
+    _mm512_reduce_add_ps(acc)
+}
+
+/// y[..d] += alpha * x[..d].
+///
+/// # Safety
+/// avx512f is available; x[..d] and y[..d] are in bounds and do not overlap.
+#[target_feature(enable = "avx512f")]
+unsafe fn axpy(y: *mut f32, alpha: f32, x: *const f32, d: usize) {
+    let va = _mm512_set1_ps(alpha);
+    let mut j = 0;
+    while j < d {
+        let mk = tail_mask(d - j);
+        // SAFETY: lanes j..min(j+16, d) are in bounds; the rest are masked off.
+        unsafe {
+            let vy = _mm512_maskz_loadu_ps(mk, y.add(j));
+            let vx = _mm512_maskz_loadu_ps(mk, x.add(j));
+            _mm512_mask_storeu_ps(y.add(j), mk, _mm512_fmadd_ps(va, vx, vy));
+        }
+        j += L;
+    }
+}
+
+/// y[..d] (+)= sum_s coef[s] * x(s)[..d], where x(s) = x.add(s*x_stride).
+/// Each 16-lane chunk of y stays in a register across s.
+///
+/// # Safety
+/// avx512f is available; y[..d] and every x(s)[..d] for s < coef.len() are in
+/// bounds; y overlaps no x(s).
+#[target_feature(enable = "avx512f")]
+unsafe fn weighted_sum(
+    y: *mut f32,
+    acc_in: bool,
+    coef: &[f32],
+    x: *const f32,
+    x_stride: usize,
+    d: usize,
+) {
+    let mut j = 0;
+    while j < d {
+        let mk = tail_mask(d - j);
+        let mut acc = _mm512_setzero_ps();
+        if acc_in {
+            // SAFETY: y lanes < d are in bounds; the rest are masked off.
+            acc = unsafe { _mm512_maskz_loadu_ps(mk, y.add(j)) };
+        }
+        for (s, &cs) in coef.iter().enumerate() {
+            // SAFETY: x(s) lanes < d are in bounds; the rest are masked off.
+            let vx = unsafe { _mm512_maskz_loadu_ps(mk, x.add(s * x_stride + j)) };
+            acc = _mm512_fmadd_ps(_mm512_set1_ps(cs), vx, acc);
+        }
+        // SAFETY: as for the y load.
+        unsafe { _mm512_mask_storeu_ps(y.add(j), mk, acc) };
+        j += L;
+    }
+}
+
+/// Checks features and shapes shared by attn_fwd/bwd; returns head_dim d.
+/// `o_len` is the length of out (fwd) or dout (bwd).
+fn attn_check(
+    qkv: &[f32],
+    att: &[f32],
+    o_len: usize,
+    b: usize,
+    t: usize,
+    c: usize,
+    h: usize,
+) -> usize {
+    require_avx512();
+    assert!(
+        h > 0 && c > 0 && c.is_multiple_of(h),
+        "c={c} must be a positive multiple of h={h}"
+    );
+    assert_eq!(qkv.len(), b * t * 3 * c);
+    assert_eq!(att.len(), b * h * t * t);
+    assert_eq!(o_len, b * t * c);
+    c / h
+}
+
+/// Causal multi-head attention, same layouts as `scalar::attn_fwd`: qkv
+/// `[b,t,3c]`, out `[b,t,c]`, att `[b,h,t,t]`. Overwrites out and att (future
+/// entries 0). Scale 1/sqrt(c/h).
+pub fn attn_fwd(
+    out: &mut [f32],
+    att: &mut [f32],
+    qkv: &[f32],
+    b: usize,
+    t: usize,
+    c: usize,
+    h: usize,
+) {
+    let d = attn_check(qkv, att, out.len(), b, t, c, h);
+    let scale = 1.0 / (d as f32).sqrt();
+    let c3 = 3 * c;
+    let qp = qkv.as_ptr();
+    for bi in 0..b {
+        for hi in 0..h {
+            for tq in 0..t {
+                let q_off = (bi * t + tq) * c3 + hi * d;
+                let row = &mut att[((bi * h + hi) * t + tq) * t..][..t];
+                let mut max = f32::NEG_INFINITY;
+                for (s, r) in row[..=tq].iter_mut().enumerate() {
+                    let k_off = (bi * t + s) * c3 + c + hi * d;
+                    // SAFETY: avx512f checked; hi*d + d <= c and each token row
+                    // has 3c values, so q_off + d and k_off + d <= qkv.len().
+                    *r = unsafe { dot(qp.add(q_off), qp.add(k_off), d) } * scale;
+                    max = max.max(*r);
+                }
+                let mut sum = 0.0;
+                for p in &mut row[..=tq] {
+                    *p = (*p - max).exp();
+                    sum += *p;
+                }
+                for p in &mut row[..=tq] {
+                    *p /= sum;
+                }
+                row[tq + 1..].fill(0.0);
+                let o = &mut out[(bi * t + tq) * c + hi * d..][..d];
+                let v0 = bi * t * c3 + 2 * c + hi * d;
+                // SAFETY: avx512f checked; o has d values; v rows s <= tq < t at
+                // v0 + s*c3 .. +d are inside qkv; out and qkv are distinct slices.
+                unsafe { weighted_sum(o.as_mut_ptr(), false, &row[..=tq], qp.add(v0), c3, d) };
+            }
+        }
+    }
+}
+
+/// Backward of `attn_fwd`; ACCUMULATES into `dqkv` (`[b,t,3c]`). Uses the stored `att`.
+#[allow(clippy::too_many_arguments)]
+pub fn attn_bwd(
+    dqkv: &mut [f32],
+    dout: &[f32],
+    qkv: &[f32],
+    att: &[f32],
+    b: usize,
+    t: usize,
+    c: usize,
+    h: usize,
+) {
+    let d = attn_check(qkv, att, dout.len(), b, t, c, h);
+    assert_eq!(dqkv.len(), qkv.len());
+    let scale = 1.0 / (d as f32).sqrt();
+    let c3 = 3 * c;
+    let qp = qkv.as_ptr();
+    let gp = dqkv.as_mut_ptr();
+    DS.with(|buf| {
+        let mut buf = buf.borrow_mut();
+        if buf.len() < t {
+            buf.resize(t, 0.0);
+        }
+        for bi in 0..b {
+            for hi in 0..h {
+                for tq in 0..t {
+                    let q_off = (bi * t + tq) * c3 + hi * d;
+                    let do_ = &dout[(bi * t + tq) * c + hi * d..][..d];
+                    let p = &att[((bi * h + hi) * t + tq) * t..][..=tq];
+                    let ds = &mut buf[..=tq];
+                    // dp[s] = dout . v_s; dv_s += p[s] * dout.
+                    let mut pdp = 0.0;
+                    for (s, (dsv, &ps)) in ds.iter_mut().zip(p).enumerate() {
+                        let v_off = (bi * t + s) * c3 + 2 * c + hi * d;
+                        // SAFETY: avx512f checked; v_off + d <= qkv.len() ==
+                        // dqkv.len(); do_ lives in dout, distinct from dqkv.
+                        let dp = unsafe {
+                            axpy(gp.add(v_off), ps, do_.as_ptr(), d);
+                            dot(do_.as_ptr(), qp.add(v_off), d)
+                        };
+                        *dsv = dp;
+                        pdp += ps * dp;
+                    }
+                    // Softmax Jacobian: ds = p * (dp - sum(p*dp)) * scale.
+                    for (dsv, &ps) in ds.iter_mut().zip(p) {
+                        *dsv = ps * (*dsv - pdp) * scale;
+                    }
+                    let k0 = bi * t * c3 + c + hi * d;
+                    // SAFETY: avx512f checked. dq at q_off..+d and dk rows at
+                    // k0 + s*c3 ..+d (s <= tq < t) are inside dqkv; all reads are
+                    // from qkv, a distinct slice, and dq (cols < c) never overlaps
+                    // a dk row (cols c..2c).
+                    unsafe {
+                        weighted_sum(gp.add(q_off), true, ds, qp.add(k0), c3, d);
+                        for (s, &dsv) in ds.iter().enumerate() {
+                            axpy(gp.add(k0 + s * c3), dsv, qp.add(q_off), d);
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ops::scalar;
+    use crate::rng::Rng;
+
+    fn have_avx512() -> bool {
+        let ok = is_x86_feature_detected!("avx512f");
+        if !ok {
+            println!("NOTE: avx512f not detected; skipping AVX-512 test");
+        }
+        ok
+    }
+
+    fn randn(rng: &mut Rng, len: usize) -> Vec<f32> {
+        (0..len).map(|_| rng.normal()).collect()
+    }
+
+    fn max_abs(v: &[f32]) -> f32 {
+        v.iter().fold(0.0f32, |a, x| a.max(x.abs()))
+    }
+
+    /// max|got - want| <= 1e-4 * scale * max|want|.
+    fn assert_close(got: &[f32], want: &[f32], scale: usize, what: &str) {
+        assert_eq!(got.len(), want.len(), "{what}: length");
+        let tol = 1e-4 * scale as f32 * max_abs(want);
+        let maxd = got
+            .iter()
+            .zip(want)
+            .fold(0.0f32, |a, (g, w)| a.max((g - w).abs()));
+        assert!(maxd <= tol, "{what}: max|d|={maxd} > tol={tol}");
+    }
+
+    const MM_SHAPES: [(usize, usize, usize); 5] = [
+        (1, 1, 1),
+        (7, 33, 19),
+        (64, 128, 384),
+        (300, 128, 2048),
+        (67, 517, 71),
+    ];
+
+    #[test]
+    fn avx512_matmul_matches_scalar() {
+        if !have_avx512() {
+            return;
+        }
+        let mut rng = Rng::new(11);
+        for &(n, k, m) in &MM_SHAPES {
+            let x = randn(&mut rng, n * k);
+            let w = randn(&mut rng, m * k);
+            let dout = randn(&mut rng, n * m);
+
+            let mut a = vec![5.0; n * m];
+            let mut b = vec![-3.0; n * m];
+            scalar::matmul_fwd(&mut a, &x, &w, n, k, m);
+            matmul_fwd(&mut b, &x, &w, n, k, m);
+            assert_close(&b, &a, k, &format!("fwd {n}x{k}x{m}"));
+
+            let dx0 = randn(&mut rng, n * k);
+            let dw0 = randn(&mut rng, m * k);
+            let (mut dxa, mut dwa) = (dx0.clone(), dw0.clone());
+            let (mut dxb, mut dwb) = (dx0, dw0);
+            scalar::matmul_bwd(&mut dxa, &mut dwa, &dout, &x, &w, n, k, m);
+            matmul_bwd(&mut dxb, &mut dwb, &dout, &x, &w, n, k, m);
+            assert_close(&dxb, &dxa, m, &format!("dx {n}x{k}x{m}"));
+            assert_close(&dwb, &dwa, n, &format!("dw {n}x{k}x{m}"));
+        }
+    }
+
+    /// Row-range entry points (for Task 12a) reproduce the full call when the
+    /// rows are split at uneven points.
+    #[test]
+    fn avx512_matmul_row_ranges_match_full() {
+        if !have_avx512() {
+            return;
+        }
+        let (n, k, m) = (67, 45, 71);
+        let mut rng = Rng::new(13);
+        let x = randn(&mut rng, n * k);
+        let w = randn(&mut rng, m * k);
+        let dout = randn(&mut rng, n * m);
+        let mut full = vec![0.0; n * m];
+        matmul_fwd(&mut full, &x, &w, n, k, m);
+        let mut packed = vec![0.0; packed_len(k, m)];
+        pack_wt(&mut packed, &w, k, m);
+        let mut split = vec![0.0; n * m];
+        let (a, rest) = split.split_at_mut(13 * m);
+        matmul_fwd_rows(a, &x[..13 * k], &packed, 13, k, m);
+        matmul_fwd_rows(rest, &x[13 * k..], &packed, n - 13, k, m);
+        assert_eq!(split, full);
+
+        let dx0 = randn(&mut rng, n * k);
+        let dw0 = randn(&mut rng, m * k);
+        let (mut dxf, mut dwf) = (dx0.clone(), dw0.clone());
+        matmul_bwd(&mut dxf, &mut dwf, &dout, &x, &w, n, k, m);
+        let (mut dxs, mut dws) = (dx0, dw0);
+        let (d1, d2) = dxs.split_at_mut(29 * k);
+        matmul_bwd_dx_rows(d1, &dout[..29 * m], &w, 29, k, m);
+        matmul_bwd_dx_rows(d2, &dout[29 * m..], &w, n - 29, k, m);
+        let (w1, w2) = dws.split_at_mut(8 * k);
+        matmul_bwd_dw_rows(w1, 0, 8, &dout, &x, n, k, m);
+        matmul_bwd_dw_rows(w2, 8, m - 8, &dout, &x, n, k, m);
+        assert_eq!(dxs, dxf);
+        assert_eq!(dws, dwf);
+    }
+
+    #[test]
+    #[ignore]
+    fn avx512_timing_print() {
+        if !have_avx512() {
+            return;
+        }
+        let (n, k, m) = (4096, 128, 384);
+        let mut rng = Rng::new(1);
+        let x = randn(&mut rng, n * k);
+        let w = randn(&mut rng, m * k);
+        let dout = randn(&mut rng, n * m);
+        let mut out = vec![0.0; n * m];
+        let (mut dx, mut dw) = (vec![0.0; n * k], vec![0.0; m * k]);
+        let t0 = std::time::Instant::now();
+        for _ in 0..5 {
+            matmul_fwd(&mut out, &x, &w, n, k, m);
+        }
+        println!("avx512 fwd {n}x{k}x{m}: {:?}/iter", t0.elapsed() / 5);
+        let t0 = std::time::Instant::now();
+        for _ in 0..5 {
+            matmul_bwd(&mut dx, &mut dw, &dout, &x, &w, n, k, m);
+        }
+        println!("avx512 bwd {n}x{k}x{m}: {:?}/iter", t0.elapsed() / 5);
+    }
+
+    const ATTN_SHAPES: [(usize, usize, usize, usize); 4] =
+        [(1, 1, 8, 1), (2, 7, 64, 2), (2, 256, 128, 4), (1, 9, 40, 2)];
+
+    #[test]
+    fn avx512_attn_matches_scalar() {
+        if !have_avx512() {
+            return;
+        }
+        let mut rng = Rng::new(12);
+        for &(b, t, c, h) in &ATTN_SHAPES {
+            let qkv = randn(&mut rng, b * t * 3 * c);
+            let dout = randn(&mut rng, b * t * c);
+            let what = format!("b{b} t{t} c{c} h{h}");
+
+            let (mut oa, mut aa) = (vec![5.0; b * t * c], vec![5.0; b * h * t * t]);
+            let (mut ob, mut ab) = (vec![-3.0; b * t * c], vec![-3.0; b * h * t * t]);
+            scalar::attn_fwd(&mut oa, &mut aa, &qkv, b, t, c, h);
+            attn_fwd(&mut ob, &mut ab, &qkv, b, t, c, h);
+            assert_close(&ob, &oa, t, &format!("out {what}"));
+            assert_close(&ab, &aa, t, &format!("att {what}"));
+
+            let d0 = randn(&mut rng, qkv.len());
+            let (mut da, mut db) = (d0.clone(), d0);
+            scalar::attn_bwd(&mut da, &dout, &qkv, &aa, b, t, c, h);
+            attn_bwd(&mut db, &dout, &qkv, &aa, b, t, c, h);
+            assert_close(&db, &da, t, &format!("dqkv {what}"));
+        }
+    }
+}
