@@ -50,12 +50,37 @@ pub fn dialogue_views(turns: &[String]) -> Vec<Vec<String>> {
         .collect()
 }
 
+/// A turn as people type it in a chat box: lowercase, no final period or exclamation mark
+/// ("How are you?" stays a question: "how are you?").
+pub fn casual(s: &str) -> String {
+    let t = s.trim().trim_end_matches(['.', '!']).trim_end();
+    t.to_lowercase()
+}
+
+/// Makes every user turn (even index) of a dialogue view casual.
+pub fn casualize_users(turns: &mut [String]) {
+    for t in turns.iter_mut().step_by(2) {
+        *t = casual(t);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn casual_turns() {
+        assert_eq!(casual("Hi, Tom."), "hi, tom");
+        assert_eq!(casual("Wow!!"), "wow");
+        assert_eq!(casual("How are you?"), "how are you?");
+        assert_eq!(casual("  I'm FINE. "), "i'm fine");
+        let mut v = s(&["Hello.", "Hi there.", "What's up?", "Not much."]);
+        casualize_users(&mut v);
+        assert_eq!(v, s(&["hello", "Hi there.", "what's up?", "Not much."]), "assistant turns untouched");
     }
 
     #[test]

@@ -2,26 +2,44 @@
 //! and DailyDialog (multi-turn SFT): pretrain_{train,val}.txt and sft_{train,val}.jsonl.
 
 use rllm::rng::Rng;
-use rllm_prep::synth::{filler_pool, identity_dialogue, memory_dialogue, TRAIN};
-use rllm_prep::tiny::{dialogue_views, parse_dialogue, split_stories};
+use rllm_prep::synth::{distractor_dialogue, filler_pool, identity_dialogue, memory_dialogue, TRAIN};
+use rllm_prep::tiny::{casualize_users, dialogue_views, parse_dialogue, split_stories};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 const USAGE: &str = "usage: extract_tiny --stories <train.txt> --stories-val <valid.txt> \
 --dd-train <dialogues_train.txt> --dd-val <dialogues_validation.txt> [--out data-tiny] [--max-pretrain-mb 100] \
-[--synth-memory N] [--synth-identity N] [--seed 1]";
+[--synth-memory N] [--synth-identity N] [--synth-distractor N] [--casual-pct 0..100] [--seed 1]";
 
-/// Appends synthetic memory and identity dialogues (train names and places only).
-fn append_synth(dst: &Path, dd: &Path, memory: usize, identity: usize, seed: u64) -> io::Result<()> {
+/// Counts of synthetic dialogues to append to the SFT training file.
+struct SynthCounts {
+    memory: usize,
+    identity: usize,
+    distractor: usize,
+}
+
+/// Appends synthetic memory, identity and distractor dialogues (train names and places
+/// only); `casual_pct` percent of them get casual user turns.
+fn append_synth(dst: &Path, dd: &Path, n: &SynthCounts, casual_pct: u64, seed: u64) -> io::Result<()> {
     let dialogues: Vec<Vec<String>> =
         std::fs::read_to_string(dd)?.lines().map(parse_dialogue).filter(|d| !d.is_empty()).collect();
     let pool = filler_pool(&dialogues);
     let mut f = BufWriter::new(std::fs::OpenOptions::new().append(true).open(dst)?);
     let mut rng = Rng::new(seed);
-    for i in 0..memory + identity {
-        let s = if i < memory { memory_dialogue(&mut rng, TRAIN, &pool) } else { identity_dialogue(&mut rng, &pool) };
-        serde_json::to_writer(&mut f, &serde_json::json!({ "turns": s.turns }))?;
+    for i in 0..n.memory + n.identity + n.distractor {
+        let s = if i < n.memory {
+            memory_dialogue(&mut rng, TRAIN, &pool)
+        } else if i < n.memory + n.identity {
+            identity_dialogue(&mut rng, &pool)
+        } else {
+            distractor_dialogue(&mut rng, TRAIN, &pool)
+        };
+        let mut turns = s.turns;
+        if (rng.below(100) as u64) < casual_pct {
+            casualize_users(&mut turns);
+        }
+        serde_json::to_writer(&mut f, &serde_json::json!({ "turns": turns }))?;
         f.write_all(b"\n")?;
     }
     f.flush()
@@ -48,7 +66,8 @@ fn write_stories(src: &Path, dst: &Path, max_bytes: usize) -> io::Result<(usize,
     Ok((n, bytes))
 }
 
-fn write_dialogues(src: &Path, dst: &Path) -> io::Result<(usize, usize)> {
+/// `casual_pct` percent of the dialogue views get casual (lowercase, unpunctuated) user turns.
+fn write_dialogues(src: &Path, dst: &Path, casual_pct: u64, rng: &mut Rng) -> io::Result<(usize, usize)> {
     let text = std::fs::read_to_string(src)?;
     let mut f = BufWriter::new(std::fs::File::create(dst)?);
     let (mut dialogues, mut records) = (0, 0);
@@ -58,7 +77,10 @@ fn write_dialogues(src: &Path, dst: &Path) -> io::Result<(usize, usize)> {
             continue;
         }
         dialogues += 1;
-        for v in dialogue_views(&turns) {
+        for mut v in dialogue_views(&turns) {
+            if (rng.below(100) as u64) < casual_pct {
+                casualize_users(&mut v);
+            }
             serde_json::to_writer(&mut f, &serde_json::json!({ "turns": v }))?;
             f.write_all(b"\n")?;
             records += 1;
@@ -72,7 +94,7 @@ fn main() -> ExitCode {
     let mut a: [Option<PathBuf>; 4] = Default::default();
     let mut out = PathBuf::from("data-tiny");
     let mut mb = 100usize;
-    let (mut memory, mut identity, mut seed) = (0usize, 0usize, 1u64);
+    let (mut memory, mut identity, mut distractor, mut casual_pct, mut seed) = (0usize, 0usize, 0usize, 0u64, 1u64);
     let mut args = std::env::args().skip(1);
     while let Some(k) = args.next() {
         let Some(v) = args.next() else {
@@ -85,11 +107,14 @@ fn main() -> ExitCode {
             "--dd-train" => a[2] = Some(v.into()),
             "--dd-val" => a[3] = Some(v.into()),
             "--out" => out = v.into(),
-            "--max-pretrain-mb" | "--synth-memory" | "--synth-identity" | "--seed" => match v.parse::<u64>() {
+            "--max-pretrain-mb" | "--synth-memory" | "--synth-identity" | "--synth-distractor" | "--casual-pct"
+            | "--seed" => match v.parse::<u64>() {
                 Ok(n) => match k.as_str() {
                     "--max-pretrain-mb" => mb = n as usize,
                     "--synth-memory" => memory = n as usize,
                     "--synth-identity" => identity = n as usize,
+                    "--synth-distractor" => distractor = n as usize,
+                    "--casual-pct" => casual_pct = n.min(100),
                     _ => seed = n,
                 },
                 Err(_) => {
@@ -113,13 +138,18 @@ fn main() -> ExitCode {
         println!("pretrain_train.txt: {n} stories, {:.1} MB", b as f64 / 1e6);
         let (n, b) = write_stories(&sv, &out.join("pretrain_val.txt"), usize::MAX)?;
         println!("pretrain_val.txt: {n} stories, {:.1} MB", b as f64 / 1e6);
-        for (src, split) in [(&dt, "train"), (&dv, "val")] {
-            let (d, r) = write_dialogues(src, &out.join(format!("sft_{split}.jsonl")))?;
-            println!("sft_{split}.jsonl: {d} dialogues -> {r} records");
+        // validation stays as written, so its loss compares with earlier runs
+        let mut rng = Rng::new(seed.wrapping_add(7));
+        for (src, split, pct) in [(&dt, "train", casual_pct), (&dv, "val", 0)] {
+            let (d, r) = write_dialogues(src, &out.join(format!("sft_{split}.jsonl")), pct, &mut rng)?;
+            println!("sft_{split}.jsonl: {d} dialogues -> {r} records ({pct}% casual user turns)");
         }
-        if memory + identity > 0 {
-            append_synth(&out.join("sft_train.jsonl"), &dt, memory, identity, seed)?;
-            println!("sft_train.jsonl: + {memory} memory and {identity} identity dialogues");
+        let counts = SynthCounts { memory, identity, distractor };
+        if memory + identity + distractor > 0 {
+            append_synth(&out.join("sft_train.jsonl"), &dt, &counts, casual_pct, seed)?;
+            println!(
+                "sft_train.jsonl: + {memory} memory, {identity} identity, {distractor} distractor dialogues"
+            );
         }
         Ok(())
     };

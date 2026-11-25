@@ -85,41 +85,95 @@ struct FactKind {
 }
 
 const NAME: FactKind = FactKind {
-    tell: &["Hi, I'm {}.", "My name is {}.", "hello! my name is {}", "I'm {}, nice to meet you.", "Call me {}.", "hey, {} here."],
-    ack: &["Nice to meet you, {}!", "Hi {}! How are you?", "Hello, {}. I'm Rllm.", "Good to meet you, {}."],
-    ask: &["What's my name?", "Do you remember my name?", "what is my name again?", "Who am I?", "whats my name", "Can you tell me my name?"],
-    answer: &["Your name is {}.", "You're {}.", "You told me your name is {}.", "Of course, you're {}."],
+    tell: &[
+        "Hi, I'm {}.", "My name is {}.", "hello! my name is {}", "I'm {}, nice to meet you.", "Call me {}.",
+        "hey, {} here.", "Hello there, I'm {}.", "People call me {}.", "You can call me {}.", "Hi! {} here.",
+    ],
+    ack: &[
+        "Nice to meet you, {}!", "Hi {}! How are you?", "Hello, {}. I'm Rllm.", "Good to meet you, {}.",
+        "Hi {}, what's up?", "Hey {}! How's your day going?", "Hello {}! What can I do for you?",
+        "Nice name, {}.",
+    ],
+    ask: &[
+        "What's my name?", "Do you remember my name?", "what is my name again?", "Who am I?", "whats my name",
+        "Can you tell me my name?", "Remember what I'm called?", "So what's my name?",
+    ],
+    answer: &[
+        "Your name is {}.", "You're {}.", "You told me your name is {}.", "Of course, you're {}.", "It's {}.",
+        "You're {}, right?", "I remember, it's {}.", "{}! You told me earlier.",
+    ],
 };
 const PLACE: FactKind = FactKind {
-    tell: &["I live in {}.", "I'm from {}.", "i'm in {} right now.", "I just moved to {}."],
-    ack: &["Oh, {}! How do you like it there?", "{} sounds like a nice place.", "I see, you're in {}.", "Cool, I've heard {} is nice."],
-    ask: &["Where do I live?", "Do you remember where I'm from?", "where am i?", "Which place did I tell you about?"],
-    answer: &["You're in {}.", "You told me {}.", "You said {}."],
+    tell: &[
+        "I live in {}.", "I'm from {}.", "i'm in {} right now.", "I just moved to {}.", "I grew up in {}.",
+        "My home is in {}.", "I'm staying in {} these days.", "i live in {}",
+    ],
+    ack: &[
+        "Oh, {}! How do you like it there?", "{} sounds like a nice place.", "I see, you're in {}.",
+        "Cool, I've heard {} is nice.", "{}? Is the weather nice there?", "Wow, {}! I'd love to visit.",
+        "How long have you been in {}?", "{} must be fun.",
+    ],
+    ask: &[
+        "Where do I live?", "Do you remember where I'm from?", "where am i?", "Which place did I tell you about?",
+        "Where did I say I live?", "do you know where i live", "Remember my city?", "Where am I from?",
+    ],
+    answer: &[
+        "You're in {}.", "You told me {}.", "You said {}.", "You live in {}.", "{}, right?", "In {}.",
+        "You're from {}.", "I think you said {}.",
+    ],
 };
 const FOOD: FactKind = FactKind {
-    tell: &["My favorite food is {}.", "I really love {}.", "i could eat {} every day"],
-    ack: &["{} is delicious!", "Yum, {} sounds good.", "I see, you like {}."],
-    ask: &["What's my favorite food?", "What food do I love?", "do you remember what I like to eat?"],
-    answer: &["Your favorite food is {}.", "You love {}.", "You said {}."],
+    tell: &[
+        "My favorite food is {}.", "I really love {}.", "i could eat {} every day", "I'm a big fan of {}.",
+        "Nothing beats {} for me.", "{} is the best food.", "I always order {}.", "i love {} so much",
+    ],
+    ack: &[
+        "{} is delicious!", "Yum, {} sounds good.", "I see, you like {}.", "Good choice, {} is great.",
+        "Oh, I'd eat {} too.", "{}? Nice!", "Mmm, {}.", "That makes me hungry. {} sounds great.",
+    ],
+    ask: &[
+        "What's my favorite food?", "What food do I love?", "do you remember what I like to eat?",
+        "What do I always order?", "What did I say I love to eat?", "whats my favorite food",
+        "Remember my favorite food?", "What food am I a fan of?",
+    ],
+    answer: &[
+        "Your favorite food is {}.", "You love {}.", "You said {}.", "{}, I think.", "It's {}.",
+        "You told me {}.", "{}! You love it.", "You like {} the most.",
+    ],
 };
 const COLOR: FactKind = FactKind {
-    tell: &["I like the color {}.", "My favorite color is {}.", "{} is my favorite color."],
-    ack: &["{} is a nice color.", "Oh, I like {} too.", "Got it, {}."],
-    ask: &["What color do I like?", "What's my favorite color?", "do you remember my favorite color?"],
-    answer: &["You like {}.", "Your favorite color is {}.", "You said {}."],
+    tell: &[
+        "I like the color {}.", "My favorite color is {}.", "{} is my favorite color.", "I love {} things.",
+        "i always pick {}", "{} is the best color.", "Most of my clothes are {}.", "I really like {}.",
+    ],
+    ack: &[
+        "{} is a nice color.", "Oh, I like {} too.", "Got it, {}.", "{} is pretty.", "Nice, {} looks good.",
+        "{}? That's a cool color.", "I can see why, {} is lovely.", "Good taste, {} is great.",
+    ],
+    ask: &[
+        "What color do I like?", "What's my favorite color?", "do you remember my favorite color?",
+        "Which color did I say?", "whats my favorite color", "Remember the color I like?",
+        "What color do I always pick?", "So what's my color?",
+    ],
+    answer: &[
+        "You like {}.", "Your favorite color is {}.", "You said {}.", "{}, right?", "It's {}.",
+        "You told me {}.", "{}! You love it.", "I think it's {}.",
+    ],
 };
 
 const IDENTITY: &[(&str, &[&str])] = &[
-    ("What's your name?", &["My name is Rllm.", "I'm Rllm.", "You can call me Rllm."]),
-    ("Who are you?", &["I'm Rllm, a small chat program.", "I'm Rllm."]),
-    ("your name is?", &["Rllm.", "It's Rllm."]),
-    ("What should I call you?", &["You can call me Rllm.", "Call me Rllm."]),
-    ("what's your name again?", &["It's Rllm.", "I'm Rllm."]),
-    ("Do you have a name?", &["Yes, my name is Rllm."]),
-    ("tell me your name", &["My name is Rllm."]),
-    ("Are you a human?", &["No, I'm Rllm, a small chat program."]),
-    ("Are you a person?", &["No, I'm Rllm, a computer program."]),
-    ("How old are you?", &["I'm Rllm, a program, so I don't have an age."]),
+    ("What's your name?", &["My name is Rllm.", "I'm Rllm.", "You can call me Rllm.", "I'm called Rllm."]),
+    ("Who are you?", &["I'm Rllm, a small chat program.", "I'm Rllm.", "Rllm. I'm here to chat."]),
+    ("your name is?", &["Rllm.", "It's Rllm.", "Rllm, nice to meet you."]),
+    ("What should I call you?", &["You can call me Rllm.", "Call me Rllm.", "Rllm is fine."]),
+    ("what's your name again?", &["It's Rllm.", "I'm Rllm.", "Still Rllm!"]),
+    ("Do you have a name?", &["Yes, my name is Rllm.", "Sure, I'm Rllm."]),
+    ("tell me your name", &["My name is Rllm.", "It's Rllm."]),
+    ("Are you a human?", &["No, I'm Rllm, a small chat program.", "No, I'm a program called Rllm."]),
+    ("Are you a person?", &["No, I'm Rllm, a computer program.", "Not really, I'm Rllm, a chat program."]),
+    ("How old are you?", &["I'm Rllm, a program, so I don't have an age.", "I'm a program called Rllm, so I don't have an age."]),
+    ("whats ur name", &["I'm Rllm.", "Rllm."]),
+    ("Who am I talking to?", &["You're talking to Rllm.", "This is Rllm."]),
 ];
 
 /// Up to `max` short (user, assistant) filler exchanges; total stays within `budget` chars.
@@ -167,6 +221,26 @@ pub fn memory_dialogue(rng: &mut Rng, pools: Pools, filler_pool: &[(String, Stri
     turns.push(pick(rng, kind.ask).to_string());
     turns.push(fill(pick(rng, kind.answer), v));
     Synth { turns, answer: v.to_string() }
+}
+
+/// Counter-example: the user tells a fact, then the talk moves on to an unrelated exchange
+/// that ends the dialogue, so recall answers ("Your name is ...") are only learned after a
+/// recall question. `answer` is empty: there is nothing to recall.
+pub fn distractor_dialogue(rng: &mut Rng, pools: Pools, filler_pool: &[(String, String)]) -> Synth {
+    let kinds: [(&FactKind, &[&str]); 4] =
+        [(&NAME, pools.names), (&PLACE, pools.places), (&FOOD, pools.foods), (&COLOR, pools.colors)];
+    let (kind, vals) = kinds[rng.below(4)];
+    let v = pick(rng, vals);
+    let mut turns = vec![fill(pick(rng, kind.tell), v), fill(pick(rng, kind.ack), v)];
+    let so_far: usize = turns.iter().map(String::len).sum();
+    let mut more = fillers(rng, filler_pool, 2, MAX_CHARS.saturating_sub(so_far + 160));
+    // always end on an ordinary exchange
+    if let Some((u, a)) = (!filler_pool.is_empty()).then(|| &filler_pool[rng.below(filler_pool.len())]) {
+        more.push(u.clone());
+        more.push(a.clone());
+    }
+    turns.extend(more);
+    Synth { turns, answer: String::new() }
 }
 
 /// Some filler exchanges, then a question about the assistant's identity.
@@ -241,6 +315,31 @@ mod tests {
         for _ in 0..100 {
             let s = identity_dialogue(&mut rng, &pool());
             assert!(s.turns.len() % 2 == 0 && s.turns.last().unwrap().contains(BOT_NAME));
+        }
+    }
+
+    #[test]
+    fn templates_are_varied() {
+        for k in [&NAME, &PLACE, &FOOD, &COLOR] {
+            assert!(k.tell.len() >= 8 && k.ack.len() >= 8 && k.ask.len() >= 8 && k.answer.len() >= 8);
+            for t in k.tell.iter().chain(k.ack).chain(k.answer) {
+                assert!(t.contains("{}"), "{t}");
+            }
+        }
+        assert!(IDENTITY.len() >= 12 && IDENTITY.iter().all(|(_, a)| a.iter().all(|s| s.contains(BOT_NAME))));
+    }
+
+    #[test]
+    fn distractor_ends_on_ordinary_exchange() {
+        let mut rng = Rng::new(5);
+        let pool = pool();
+        for _ in 0..200 {
+            let s = distractor_dialogue(&mut rng, TRAIN, &pool);
+            assert!(s.turns.len() >= 4 && s.turns.len() % 2 == 0, "{:?}", s.turns);
+            assert!(s.answer.is_empty());
+            let (u, a) = (&s.turns[s.turns.len() - 2], &s.turns[s.turns.len() - 1]);
+            assert!(pool.iter().any(|(pu, pa)| pu == u && pa == a), "last exchange must be filler: {:?}", s.turns);
+            assert!(s.turns.iter().map(String::len).sum::<usize>() <= MAX_CHARS);
         }
     }
 
