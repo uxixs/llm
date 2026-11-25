@@ -358,6 +358,9 @@ pub fn run(args: &Args) -> Result<(), String> {
     let dir = Path::new("runs").join(&args.name);
     std::fs::create_dir_all(&dir).map_err(|e| ioe("runs dir", e))?;
     p.save(&cfg, &dir.join("model.bin")).map_err(|e| ioe("model.bin", e))?;
+    // The model only makes sense with the tokenizer it was trained with; keep them together.
+    std::fs::copy(args.data.join("tokenizer.bin"), dir.join("tokenizer.bin"))
+        .map_err(|e| ioe("tokenizer.bin copy", e))?;
 
     // Throughput counts every position (masked SFT padding included): steps * batch * ctx.
     let pre_tok = pre_stats.steps * tokens_per_step;
