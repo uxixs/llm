@@ -93,6 +93,23 @@ fn param_count(cfg: &Config) -> Option<usize> {
 const MAGIC: &[u8; 4] = b"RLLM";
 const VERSION: u32 = 1;
 
+/// Fixed sinusoidal token embedding (`vocab × d`): row `id`, columns `2i, 2i+1` are
+/// `sin(id·ωᵢ), cos(id·ωᵢ)` with `ωᵢ = 10000^(-2i/d)`, scaled so the values have RMS `rms`.
+pub fn sin_embedding(vocab: usize, d: usize, rms: f32) -> Mat {
+    assert!(d.is_multiple_of(2), "d must be even");
+    let scale = rms * std::f32::consts::SQRT_2;
+    let mut data = vec![0.0; vocab * d];
+    for id in 0..vocab {
+        for i in 0..d / 2 {
+            let w = 10000f64.powf(-2.0 * i as f64 / d as f64);
+            let a = id as f64 * w;
+            data[id * d + 2 * i] = a.sin() as f32 * scale;
+            data[id * d + 2 * i + 1] = a.cos() as f32 * scale;
+        }
+    }
+    Mat { rows: vocab, cols: d, data }
+}
+
 impl Params {
     /// Norms = 1; matrices normal(0, 0.02) except `wo`/`w_down` at 0.02/√(2·layers).
     pub fn init(cfg: &Config, rng: &mut Rng) -> Params {
@@ -820,6 +837,27 @@ mod tests {
                 *w -= lr * d;
             }
         }
+    }
+
+    #[test]
+    fn sin_embedding_values() {
+        let m = sin_embedding(2048, 128, 0.02);
+        assert_eq!((m.rows, m.cols, m.data.len()), (2048, 128, 2048 * 128));
+        let s = 0.02 * std::f32::consts::SQRT_2;
+        // row 0: sin 0 = 0, cos 0 = 1
+        for i in 0..64 {
+            assert_eq!(m.data[2 * i], 0.0);
+            assert!((m.data[2 * i + 1] - s).abs() < 1e-7);
+        }
+        // row 1, first pair: ω₀ = 1
+        assert!((m.data[128] - 1f32.sin() * s).abs() < 1e-6);
+        assert!((m.data[129] - 1f32.cos() * s).abs() < 1e-6);
+        let rms = (m.data.iter().map(|x| x * x).sum::<f32>() / m.data.len() as f32).sqrt();
+        assert!((rms - 0.02).abs() < 1e-4, "rms {rms}");
+        // all rows distinct
+        let rows: std::collections::HashSet<Vec<u32>> =
+            m.data.chunks(128).map(|r| r.iter().map(|x| x.to_bits()).collect()).collect();
+        assert_eq!(rows.len(), 2048);
     }
 
     #[test]

@@ -20,6 +20,18 @@ pub struct Batch {
     pub mask: Vec<f32>,
 }
 
+impl Batch {
+    /// Rows of `a` followed by rows of `b`. Panics if `t` or `extra` differ.
+    pub fn concat(mut a: Batch, b: Batch) -> Batch {
+        assert_eq!((a.t, a.extra), (b.t, b.extra), "batch shapes differ");
+        a.b += b.b;
+        a.inputs.extend(b.inputs);
+        a.targets.extend(b.targets);
+        a.mask.extend(b.mask);
+        a
+    }
+}
+
 fn read_u16s(path: &Path) -> io::Result<Vec<u16>> {
     let d = std::fs::read(path)?;
     if d.len() % 2 != 0 {
@@ -206,6 +218,32 @@ mod tests {
     const A: u16 = 2046;
     const E: u16 = 2047;
     const U: u16 = 2045;
+
+    #[test]
+    fn concat_stacks_rows() {
+        let sb = SftBatcher::from_records(vec![vec![U, 1, A, 10, E]], A, E);
+        let s = sb.records_batch(0, 1, 8);
+        let p = PretrainBatcher::from_tokens((100..200).collect()).next(&mut Rng::new(1), 2, 8, 0);
+        let c = Batch::concat(s.clone(), p.clone());
+        assert_eq!((c.b, c.t, c.extra), (3, 8, 0));
+        assert_eq!(&c.inputs[..8], &s.inputs[..]);
+        assert_eq!(&c.inputs[8..], &p.inputs[..]);
+        assert_eq!(&c.targets[8..], &p.targets[..]);
+        assert_eq!(&c.mask[..8], &s.mask[..]);
+        assert!(c.mask[8..].iter().all(|&m| m == 1.0));
+        // empty side is allowed
+        let e = Batch { b: 0, t: 8, extra: 0, inputs: vec![], targets: vec![], mask: vec![] };
+        assert_eq!(Batch::concat(e, p.clone()).inputs, p.inputs);
+    }
+
+    #[test]
+    #[should_panic]
+    fn concat_rejects_shape_mismatch() {
+        let mut p = PretrainBatcher::from_tokens((100..200).collect());
+        let a = p.next(&mut Rng::new(1), 1, 8, 0);
+        let b = p.next(&mut Rng::new(1), 1, 16, 0);
+        Batch::concat(a, b);
+    }
 
     #[test]
     fn pretrain_targets_shifted() {

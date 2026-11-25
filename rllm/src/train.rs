@@ -159,9 +159,28 @@ pub struct Args {
     pub adam_lr: Option<f32>,
     /// Pool size for `--backend avx512mt` (default 4).
     pub threads: Option<usize>,
+    /// Share of each SFT batch's rows taken from pretraining text, in [0, 1), so SFT does
+    /// not wipe out what pretraining learned.
+    pub sft_mix: f64,
+    /// Learning-rate multiplier for the SFT phase (both optimizers).
+    pub sft_lr_mult: f32,
+    /// Fixed sinusoidal token embedding (also the tied output layer), never trained.
+    pub sin_embed: bool,
 }
 
-pub const USAGE: &str = "usage: train --name <run> [--data data] [--backend scalar|blocked|avx512|avx512mt|asm] [--budget 60] [--pretrain-frac 0.75] [--batch 16] [--seed 42] [--mtp N] [--bitnet] [--muon-lr X] [--adam-lr X] [--threads N]";
+/// Zeroes the token-embedding gradient so the optimizer leaves the embedding as it is.
+pub fn freeze_embedding(g: &mut Params) {
+    g.wte.data.fill(0.0);
+}
+
+pub const USAGE: &str = "usage: train --name <run> [--data data] [--backend scalar|blocked|avx512|avx512mt|asm] [--budget 60] [--pretrain-frac 0.75] [--batch 16] [--seed 42] [--mtp N] [--bitnet] [--muon-lr X] [--adam-lr X] [--threads N] [--sft-mix 0..1] [--sft-lr-mult X] [--sin-embed]";
+
+/// (SFT rows, pretrain rows) of a batch of `b` rows with `mix` of them from pretraining;
+/// at least one row is always SFT.
+pub fn sft_rows(b: usize, mix: f64) -> (usize, usize) {
+    let pre = ((b as f64 * mix).round() as usize).min(b.saturating_sub(1));
+    (b - pre, pre)
+}
 
 fn val<T: std::str::FromStr>(flag: &str, v: Option<String>) -> Result<T, String> {
     let v = v.ok_or(format!("{flag} needs a value"))?;
@@ -183,6 +202,9 @@ impl Args {
             muon_lr: None,
             adam_lr: None,
             threads: None,
+            sft_mix: 0.0,
+            sft_lr_mult: 1.0,
+            sin_embed: false,
         };
         while let Some(f) = it.next() {
             match f.as_str() {
@@ -198,8 +220,17 @@ impl Args {
                 "--muon-lr" => a.muon_lr = Some(val(&f, it.next())?),
                 "--adam-lr" => a.adam_lr = Some(val(&f, it.next())?),
                 "--threads" => a.threads = Some(val(&f, it.next())?),
+                "--sft-mix" => a.sft_mix = val(&f, it.next())?,
+                "--sft-lr-mult" => a.sft_lr_mult = val(&f, it.next())?,
+                "--sin-embed" => a.sin_embed = true,
                 _ => return Err(format!("unknown argument {f}")),
             }
+        }
+        if !(0.0..1.0).contains(&a.sft_mix) {
+            return Err("need 0 <= --sft-mix < 1".into());
+        }
+        if !(a.sft_lr_mult > 0.0 && a.sft_lr_mult.is_finite()) {
+            return Err("need --sft-lr-mult > 0".into());
         }
         if a.name.is_empty() {
             return Err("--name is required".into());
@@ -241,6 +272,10 @@ struct Phase<'a> {
     name: &'a str,
     budget: f64,
     tokens_per_step: usize,
+    /// Multiplies the schedule's lr multiplier.
+    lr_scale: f32,
+    /// Keep the token embedding fixed (`--sin-embed`).
+    freeze_wte: bool,
 }
 
 fn train_phase(
@@ -261,7 +296,10 @@ fn train_phase(
         let batch = next_batch();
         let loss = forward(p, cfg, be, acts, &batch);
         backward(p, cfg, be, acts, &batch, &mut g);
-        opt.step(p, &g, m, be);
+        if ph.freeze_wte {
+            freeze_embedding(&mut g);
+        }
+        opt.step(p, &g, m * ph.lr_scale, be);
         let now = clock.now();
         println!(
             "{} {n} {loss:.4} {:.0} {:.2}",
@@ -312,6 +350,11 @@ pub fn run(args: &Args) -> Result<(), String> {
     }
 
     let mut p = Params::init(&cfg, &mut Rng::new(args.seed));
+    if args.sin_embed {
+        // same RMS as the learned init, so activations start at the same scale
+        p.wte = crate::model::sin_embedding(cfg.vocab, cfg.d, 0.02);
+        println!("token embedding: fixed sinusoidal (not trained)");
+    }
     let (b, t) = (args.batch, cfg.ctx);
     let mut acts = Acts::new(&cfg, b, t);
     let tokens_per_step = b * t;
@@ -319,17 +362,38 @@ pub fn run(args: &Args) -> Result<(), String> {
 
     let mut opt = new_optimizer(&p, args);
     let mut rng = Rng::new(args.seed.wrapping_add(1));
-    let ph = Phase { name: "pretrain", budget: args.budget * args.pretrain_frac, tokens_per_step };
+    let ph = Phase {
+        name: "pretrain",
+        budget: args.budget * args.pretrain_frac,
+        tokens_per_step,
+        lr_scale: 1.0,
+        freeze_wte: args.sin_embed,
+    };
     let pre_stats = train_phase(ph, &clock, &mut p, &cfg, args.backend, &mut acts, &mut opt, || {
         pre.next(&mut rng, b, t, cfg.mtp)
     });
 
-    // SFT continues from the pretrained weights with fresh optimizer moments.
+    // SFT continues from the pretrained weights with fresh optimizer moments. Some rows of
+    // each batch can be pretraining text (--sft-mix) so the model keeps its fluency.
     let mut opt = new_optimizer(&p, args);
     let mut rng = Rng::new(args.seed.wrapping_add(2));
-    let ph = Phase { name: "sft", budget: args.budget * (1.0 - args.pretrain_frac), tokens_per_step };
+    let (b_sft, b_pre) = sft_rows(b, args.sft_mix);
+    if b_pre > 0 {
+        println!("sft batches: {b_sft} sft rows + {b_pre} pretrain rows, lr x{}", args.sft_lr_mult);
+    }
+    let ph = Phase {
+        name: "sft",
+        budget: args.budget * (1.0 - args.pretrain_frac),
+        tokens_per_step,
+        lr_scale: args.sft_lr_mult,
+        freeze_wte: args.sin_embed,
+    };
     let sft_stats = train_phase(ph, &clock, &mut p, &cfg, args.backend, &mut acts, &mut opt, || {
-        sft.next(&mut rng, b, t, 0)
+        let s = sft.next(&mut rng, b_sft, t, 0);
+        if b_pre == 0 {
+            return s;
+        }
+        Batch::concat(s, pre.next(&mut rng, b_pre, t, 0))
     });
 
     // Validation (outside the budget). Rows past the requested count are masked out.
@@ -511,5 +575,52 @@ old,1,2
         assert!(Args::parse(["--name".to_string()].into_iter()).is_err());
         assert!(Args::parse(["--bogus".to_string()].into_iter()).is_err());
         assert!(Args::parse(std::iter::empty()).is_err()); // --name required
+        assert_eq!((a.sft_mix, a.sft_lr_mult), (0.0, 1.0));
+    }
+
+    #[test]
+    fn args_parse_sft_mix() {
+        let p = |v: &[&str]| Args::parse(v.iter().map(|s| s.to_string()));
+        let a = p(&["--name", "x", "--sft-mix", "0.25", "--sft-lr-mult", "0.5"]).unwrap();
+        assert_eq!((a.sft_mix, a.sft_lr_mult), (0.25, 0.5));
+        for bad in [["--sft-mix", "1"], ["--sft-mix", "-0.1"], ["--sft-lr-mult", "0"], ["--sft-lr-mult", "nan"]] {
+            assert!(p(&["--name", "x", bad[0], bad[1]]).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn args_parse_sin_embed() {
+        let a = Args::parse(["--name", "x", "--sin-embed"].iter().map(|s| s.to_string())).unwrap();
+        assert!(a.sin_embed);
+        let a = Args::parse(["--name", "x"].iter().map(|s| s.to_string())).unwrap();
+        assert!(!a.sin_embed);
+    }
+
+    #[test]
+    fn frozen_embedding_unchanged_by_step() {
+        use crate::model::{sin_embedding, Config};
+        let cfg = Config { vocab: 19, d: 8, layers: 1, heads: 2, ctx: 6, softcap: 30.0, mtp: 0, bitnet: false };
+        let mut p = Params::init(&cfg, &mut Rng::new(1));
+        p.wte = sin_embedding(cfg.vocab, cfg.d, 0.02);
+        let before = p.wte.data.clone();
+        let mut g = p.zeros_like();
+        g.wte.data.fill(1.0);
+        g.final_norm.fill(1.0);
+        freeze_embedding(&mut g);
+        let mut opt = Optimizer::new(&p);
+        for _ in 0..3 {
+            opt.step(&mut p, &g, 1.0, Backend::Scalar);
+        }
+        assert_eq!(p.wte.data, before, "embedding must not move");
+        assert_ne!(p.final_norm, vec![1.0; 8], "other params still train");
+    }
+
+    #[test]
+    fn sft_rows_split() {
+        assert_eq!(sft_rows(16, 0.0), (16, 0));
+        assert_eq!(sft_rows(16, 0.25), (12, 4));
+        assert_eq!(sft_rows(16, 0.1), (14, 2)); // 1.6 rounds to 2
+        assert_eq!(sft_rows(16, 0.99), (1, 15)); // always at least one SFT row
+        assert_eq!(sft_rows(1, 0.5), (1, 0));
     }
 }
