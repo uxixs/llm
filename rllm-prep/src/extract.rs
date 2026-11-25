@@ -247,12 +247,15 @@ fn sft_for_sub(
 
 // ---------------------------------------------------------------- pretrain
 
-/// Lazily yields (submission id for split, text) for submissions then comments.
+type DocStream = Box<dyn Iterator<Item = (String, String)>>;
+
+/// Lazily yields (submission id for split, text) as two separate streams
+/// (submissions, comments) so the caller can interleave them.
 fn pretrain_docs(
     subs_path: &Path,
     comments_path: &Path,
     skipped: &Counter,
-) -> io::Result<Box<dyn Iterator<Item = (String, String)>>> {
+) -> io::Result<(DocStream, DocStream)> {
     let subs = open_zst_ndjson_counted(subs_path, skipped.clone())?.filter_map(|v| {
         let (id, q) = parse_submission(&v)?;
         Some((id, q))
@@ -263,7 +266,7 @@ fn pretrain_docs(
         let body = clean_text(v.get("body")?.as_str()?)?;
         Some((id, body))
     });
-    Ok(Box::new(subs.chain(coms)))
+    Ok((Box::new(subs), Box::new(coms)))
 }
 
 // -------------------------------------------------------------------- run
@@ -344,11 +347,15 @@ pub fn run(cfg: &ExtractConfig) -> io::Result<ExtractStats> {
     stats.sft_total = stats.sft_train + stats.sft_val;
     stats.skipped_sft = skipped_sft.load(Ordering::Relaxed);
 
-    // --- pretraining, round-robin across subreddits
+    // --- pretraining, round-robin across all 6 streams (submissions and
+    // comments of each subreddit), so comment bodies appear even when the
+    // byte limit is hit long before any submissions stream is exhausted
     let skipped_pre: Counter = Arc::new(AtomicU64::new(0));
     let mut sources = Vec::new();
     for (_, s, c) in &paths {
-        sources.push(pretrain_docs(s, c, &skipped_pre)?);
+        let (subs, coms) = pretrain_docs(s, c, &skipped_pre)?;
+        sources.push(subs);
+        sources.push(coms);
     }
     let mut ptrain = BufWriter::new(File::create(cfg.out_dir.join("pretrain_train.txt"))?);
     let mut pval = BufWriter::new(File::create(cfg.out_dir.join("pretrain_val.txt"))?);

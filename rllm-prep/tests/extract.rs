@@ -301,3 +301,20 @@ fn pretrain_round_robin_and_limit() {
     let (e, n, a) = (counts[&'e'], counts[&'n'], counts[&'a']);
     assert!(e.abs_diff(n) <= 1 && n.abs_diff(a) <= 1, "{e} {n} {a}");
 }
+
+#[test]
+fn pretrain_includes_comments_when_submissions_exceed_limit() {
+    let s: Vec<String> = (0..500)
+        .map(|i| sub(&format!("s{i}"), &format!("title {i} {}", "w".repeat(200)), ""))
+        .collect();
+    let c: Vec<String> = (0..500)
+        .map(|i| com(&format!("c{i}"), &format!("s{i}"), &format!("t3_s{i}"), &format!("COMMENTBODY {i}"), 1, "a"))
+        .collect();
+    let dumps = make_dumps("mix", &[("askscience", s, c)]);
+    // submissions alone (~100 KB) are far over the 10 KB limit
+    let (out, _) = run_extract(&dumps, "mix", 10_000);
+    let text = fs::read_to_string(out.join("pretrain_train.txt")).unwrap()
+        + &fs::read_to_string(out.join("pretrain_val.txt")).unwrap();
+    assert!(text.contains("COMMENTBODY"), "no comment bodies in pretrain output");
+    assert!(text.contains("title "));
+}
