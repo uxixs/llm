@@ -8,3 +8,4 @@ rllm = { path = "../rllm" }
 zstd = "0.13"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+memchr = "2"

@@ -1,19 +1,20 @@
-//! Pushshift dump extraction: pretraining text and SFT question/answer pairs.
+//! Monthly all-Reddit Pushshift extraction: pretraining text and SFT pairs.
 
+use memchr::memmem;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::OnceLock;
 
-/// Subreddit dump prefixes (exact case as used by Pushshift).
+/// Subreddits to keep (matched case-insensitively).
 pub const SUBS: [&str; 3] = ["explainlikeimfive", "NoStupidQuestions", "askscience"];
-const ELI5: &str = "explainlikeimfive";
-const NSQ: &str = "NoStupidQuestions";
+const NSQ_IDX: usize = 1;
+const ASK_IDX: usize = 2;
 const DOC_SEP: &str = "\n\x1e\n";
+const PROGRESS_EVERY: u64 = 1_000_000;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct SftPair {
@@ -23,57 +24,45 @@ pub struct SftPair {
 
 // ---------------------------------------------------------------- reading
 
-type Counter = Arc<AtomicU64>;
-
-struct NdjsonIter<R: BufRead> {
-    reader: R,
-    buf: Vec<u8>,
-    skipped: Counter,
-}
-
-impl<R: BufRead> Iterator for NdjsonIter<R> {
-    type Item = Value;
-    fn next(&mut self) -> Option<Value> {
-        loop {
-            self.buf.clear();
-            match self.reader.read_until(b'\n', &mut self.buf) {
-                Ok(0) => return None,
-                Ok(_) => {}
-                Err(e) => {
-                    // truncated / corrupt stream: count once and stop
-                    eprintln!("warning: read error, stopping this file early: {e}");
-                    self.skipped.fetch_add(1, Ordering::Relaxed);
-                    return None;
-                }
-            }
-            if self.buf.iter().all(|b| b.is_ascii_whitespace()) {
-                continue;
-            }
-            match serde_json::from_slice::<Value>(&self.buf) {
-                Ok(v) => return Some(v),
-                Err(_) => {
-                    self.skipped.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-        }
-    }
-}
-
-/// Streams a zstd-compressed NDJSON file. Unparsable lines are counted in
-/// `skipped` and skipped.
-pub fn open_zst_ndjson_counted(
-    path: &Path,
-    skipped: Counter,
-) -> io::Result<impl Iterator<Item = Value>> {
+/// Streams every non-blank line of a zstd file to `f` (one pass, constant
+/// memory). A read error mid-stream (truncated file) warns and stops this file.
+pub fn for_each_line(path: &Path, mut f: impl FnMut(&[u8])) -> io::Result<()> {
     let file = File::open(path)
         .map_err(|e| io::Error::new(e.kind(), format!("cannot open {}: {e}", path.display())))?;
     let mut dec = zstd::stream::Decoder::new(file)?;
     dec.window_log_max(31)?; // Pushshift dumps use long-window zstd
-    Ok(NdjsonIter { reader: BufReader::with_capacity(1 << 20, dec), buf: Vec::new(), skipped })
+    let mut reader = BufReader::with_capacity(1 << 20, dec);
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf) {
+            Ok(0) => return Ok(()),
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("warning: read error in {}, stopping this file early: {e}", path.display());
+                return Ok(());
+            }
+        }
+        if !buf.iter().all(|b| b.is_ascii_whitespace()) {
+            f(&buf);
+        }
+    }
 }
 
-pub fn open_zst_ndjson(path: &Path) -> io::Result<impl Iterator<Item = Value>> {
-    open_zst_ndjson_counted(path, Arc::new(AtomicU64::new(0)))
+/// Cheap byte-level check run before JSON parsing: does the line contain
+/// `"subreddit":"<name>"` for one of [`SUBS`] (case-insensitive)? It can give
+/// false positives (e.g. a nested object), so callers must re-check the parsed field.
+pub fn prefilter(line: &[u8]) -> bool {
+    static KEY: OnceLock<memmem::Finder<'static>> = OnceLock::new();
+    let key = KEY.get_or_init(|| memmem::Finder::new(b"\"subreddit\":\""));
+    key.find_iter(line).any(|p| {
+        let rest = &line[p + key.needle().len()..];
+        SUBS.iter().any(|n| {
+            rest.len() > n.len()
+                && rest[..n.len()].eq_ignore_ascii_case(n.as_bytes())
+                && rest[n.len()] == b'"'
+        })
+    })
 }
 
 // --------------------------------------------------------------- cleaning
@@ -142,138 +131,141 @@ pub fn split_is_val(submission_id: &str) -> bool {
 
 // ------------------------------------------------------------ field access
 
-/// (id, cleaned "title\nselftext") of a submission, or None when unusable.
-fn parse_submission(v: &Value) -> Option<(String, String)> {
-    let id = v.get("id")?.as_str()?;
-    let title = clean_text(v.get("title")?.as_str()?)?;
-    let selftext = v.get("selftext").and_then(Value::as_str).and_then(clean_text);
-    let q = match selftext {
-        Some(s) => format!("{title}\n{s}"),
-        None => title,
-    };
-    Some((id.to_string(), q))
+fn sub_index(v: &Value) -> Option<usize> {
+    let s = v.get("subreddit")?.as_str()?;
+    SUBS.iter().position(|n| n.eq_ignore_ascii_case(s))
 }
 
-struct Comment<'a> {
-    link_id: &'a str,
-    top_level: bool,
-    body: &'a str,
-    score: i64,
-    author: &'a str,
-}
-
-fn parse_comment(v: &Value) -> Option<Comment<'_>> {
-    let link = v.get("link_id")?.as_str()?;
-    let parent = v.get("parent_id")?.as_str()?;
-    Some(Comment {
-        link_id: link.strip_prefix("t3_").unwrap_or(link),
-        top_level: parent == link,
-        body: v.get("body")?.as_str()?,
-        score: v.get("score")?.as_i64()?,
-        author: v.get("author")?.as_str()?,
-    })
-}
-
-// -------------------------------------------------------------- SFT pairs
+// ------------------------------------------------------------------- scan
 
 struct Candidate {
     score: i64,
     answer: String,
 }
 
-/// Streams comments, keeping the best qualifying top-level answer per
-/// submission that is in `questions`.
-fn best_answers(
-    comments: impl Iterator<Item = Value>,
-    questions: &HashMap<String, String>,
-    max_answer_chars: usize,
-    skipped: &AtomicU64,
-) -> HashMap<String, Candidate> {
-    let mut best: HashMap<String, Candidate> = HashMap::new();
-    for v in comments {
-        let Some(c) = parse_comment(&v) else {
-            skipped.fetch_add(1, Ordering::Relaxed);
-            continue;
+/// State filled by the single pass over every file.
+struct Scan {
+    max_stream_bytes: u64,
+    /// (is NSQ, cleaned "title\nselftext") per ELI5/NSQ submission id.
+    questions: HashMap<String, (bool, String)>,
+    /// Best qualifying top-level answer per submission id.
+    best: HashMap<String, Candidate>,
+    /// Pretrain buffers (split id, text): per subreddit, [submissions, comments].
+    /// Each is capped at the pretrain byte limit, since the output can never
+    /// use more than that from any single stream.
+    streams: [Vec<(String, String)>; 6],
+    stream_bytes: [u64; 6],
+    kept_per_sub: [u64; 3],
+    lines_read: u64,
+    lines_kept: u64,
+    skipped: u64,
+}
+
+impl Scan {
+    fn new(max_stream_bytes: u64) -> Self {
+        Scan {
+            max_stream_bytes,
+            questions: HashMap::new(),
+            best: HashMap::new(),
+            streams: Default::default(),
+            stream_bytes: [0; 6],
+            kept_per_sub: [0; 3],
+            lines_read: 0,
+            lines_kept: 0,
+            skipped: 0,
+        }
+    }
+
+    fn push_doc(&mut self, stream: usize, id: &str, text: String) {
+        if self.stream_bytes[stream] < self.max_stream_bytes {
+            self.stream_bytes[stream] += (text.len() + DOC_SEP.len()) as u64;
+            self.streams[stream].push((id.to_string(), text));
+        }
+    }
+
+    fn line(&mut self, line: &[u8], is_submission: bool) {
+        self.lines_read += 1;
+        if self.lines_read % PROGRESS_EVERY == 0 {
+            eprintln!(
+                "progress: {} lines read, {} kept, {:.1} MB pretrain text buffered",
+                self.lines_read,
+                self.lines_kept,
+                self.stream_bytes.iter().sum::<u64>() as f64 / 1e6
+            );
+        }
+        if !prefilter(line) {
+            return;
+        }
+        let Ok(v) = serde_json::from_slice::<Value>(line) else {
+            self.skipped += 1;
+            return;
         };
-        if !c.top_level || c.score < 10 || c.author == "AutoModerator" {
-            continue;
-        }
-        if !questions.contains_key(c.link_id) {
-            continue;
-        }
-        if best.get(c.link_id).is_some_and(|b| b.score >= c.score) {
-            continue;
-        }
-        let Some(a) = clean_text(c.body) else { continue };
-        let n = a.chars().count();
-        if !(20..=max_answer_chars).contains(&n) {
-            continue;
-        }
-        best.insert(c.link_id.to_string(), Candidate { score: c.score, answer: a });
-    }
-    best
-}
-
-/// Pairs (submission id, score, pair) for one subreddit.
-fn sft_for_sub(
-    subs_path: &Path,
-    comments_path: &Path,
-    max_answer_chars: usize,
-    skipped: &Counter,
-) -> io::Result<Vec<(String, i64, SftPair)>> {
-    let mut questions = HashMap::new();
-    for v in open_zst_ndjson_counted(subs_path, skipped.clone())? {
-        match parse_submission(&v) {
-            Some((id, q)) => {
-                questions.insert(id, q);
-            }
-            None => {
-                skipped.fetch_add(1, Ordering::Relaxed);
-            }
+        // the prefilter has false positives: trust only the parsed field
+        let Some(sub) = sub_index(&v) else { return };
+        self.lines_kept += 1;
+        self.kept_per_sub[sub] += 1;
+        let ok = if is_submission { self.submission(&v, sub) } else { self.comment(&v, sub) };
+        if !ok {
+            self.skipped += 1;
         }
     }
-    let comments = open_zst_ndjson_counted(comments_path, skipped.clone())?;
-    let best = best_answers(comments, &questions, max_answer_chars, skipped);
-    let mut out: Vec<_> = best
-        .into_iter()
-        .map(|(id, c)| {
-            let q = questions[&id].clone();
-            (id, c.score, SftPair { q, a: c.answer })
-        })
-        .collect();
-    out.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(out)
-}
 
-// ---------------------------------------------------------------- pretrain
+    /// Returns false when required fields are missing.
+    fn submission(&mut self, v: &Value, sub: usize) -> bool {
+        let (Some(id), Some(title)) =
+            (v.get("id").and_then(Value::as_str), v.get("title").and_then(Value::as_str))
+        else {
+            return false;
+        };
+        let Some(title) = clean_text(title) else { return true };
+        let q = match v.get("selftext").and_then(Value::as_str).and_then(clean_text) {
+            Some(s) => format!("{title}\n{s}"),
+            None => title,
+        };
+        if sub != ASK_IDX {
+            self.questions.insert(id.to_string(), (sub == NSQ_IDX, q.clone()));
+        }
+        self.push_doc(sub * 2, id, q);
+        true
+    }
 
-type DocStream = Box<dyn Iterator<Item = (String, String)>>;
-
-/// Lazily yields (submission id for split, text) as two separate streams
-/// (submissions, comments) so the caller can interleave them.
-fn pretrain_docs(
-    subs_path: &Path,
-    comments_path: &Path,
-    skipped: &Counter,
-) -> io::Result<(DocStream, DocStream)> {
-    let subs = open_zst_ndjson_counted(subs_path, skipped.clone())?.filter_map(|v| {
-        let (id, q) = parse_submission(&v)?;
-        Some((id, q))
-    });
-    let coms = open_zst_ndjson_counted(comments_path, skipped.clone())?.filter_map(|v| {
-        let c = v.get("link_id")?.as_str()?;
-        let id = c.strip_prefix("t3_").unwrap_or(c).to_string();
-        let body = clean_text(v.get("body")?.as_str()?)?;
-        Some((id, body))
-    });
-    Ok((Box::new(subs), Box::new(coms)))
+    /// Returns false when required fields are missing.
+    fn comment(&mut self, v: &Value, sub: usize) -> bool {
+        let (Some(link), Some(body)) =
+            (v.get("link_id").and_then(Value::as_str), v.get("body").and_then(Value::as_str))
+        else {
+            return false;
+        };
+        let id = link.strip_prefix("t3_").unwrap_or(link);
+        let Some(text) = clean_text(body) else { return true };
+        // SFT: only top-level comments on a submission we have (RS may lack it)
+        if let (Some(parent), Some(score), Some(author), Some((is_nsq, _))) = (
+            v.get("parent_id").and_then(Value::as_str),
+            v.get("score").and_then(Value::as_i64),
+            v.get("author").and_then(Value::as_str),
+            self.questions.get(id),
+        ) {
+            let max_chars = if *is_nsq { 300 } else { 800 };
+            let n = text.chars().count();
+            let beats = self.best.get(id).is_none_or(|b| b.score < score);
+            if parent == link && score >= 10 && author != "AutoModerator" && beats && (20..=max_chars).contains(&n)
+            {
+                self.best.insert(id.to_string(), Candidate { score, answer: text.clone() });
+            }
+        }
+        self.push_doc(sub * 2 + 1, id, text);
+        true
+    }
 }
 
 // -------------------------------------------------------------------- run
 
 #[derive(Debug, Clone)]
 pub struct ExtractConfig {
-    pub subs_dir: PathBuf,
+    /// Monthly submission files (`RS_YYYY-MM.zst`), read before the comments.
+    pub rs_files: Vec<PathBuf>,
+    /// Monthly comment files (`RC_YYYY-MM.zst`).
+    pub rc_files: Vec<PathBuf>,
     pub out_dir: PathBuf,
     pub max_pretrain_bytes: u64,
 }
@@ -287,44 +279,50 @@ pub struct ExtractStats {
     pub sft_total: usize,
     pub sft_eli5: usize,
     pub sft_nsq: usize,
-    /// Malformed or incomplete lines skipped while building SFT pairs.
-    pub skipped_sft: u64,
-    /// Malformed or incomplete lines skipped while building pretraining text.
-    pub skipped_pretrain: u64,
-}
-
-/// Finds `<sub>_<kind>.zst` in `dir`, matching the file name case-insensitively.
-fn find_dump(dir: &Path, sub: &str, kind: &str) -> io::Result<PathBuf> {
-    let want = format!("{sub}_{kind}.zst");
-    let lower = want.to_lowercase();
-    if let Ok(rd) = fs::read_dir(dir) {
-        for e in rd.flatten() {
-            if e.file_name().to_string_lossy().to_lowercase() == lower {
-                return Ok(e.path());
-            }
-        }
-    }
-    Err(io::Error::new(
-        io::ErrorKind::NotFound,
-        format!("missing dump file {want} in {}", dir.display()),
-    ))
+    pub lines_read: u64,
+    /// Lines whose parsed subreddit is one of the three kept.
+    pub lines_kept: u64,
+    /// Lines that passed the prefilter but were unparsable or lacked required fields.
+    pub skipped: u64,
+    /// Subreddits with zero matching lines (warned about, not an error).
+    pub missing_subs: Vec<String>,
 }
 
 pub fn run(cfg: &ExtractConfig) -> io::Result<ExtractStats> {
-    let mut paths = Vec::new();
-    for s in SUBS {
-        paths.push((s, find_dump(&cfg.subs_dir, s, "submissions")?, find_dump(&cfg.subs_dir, s, "comments")?));
+    // fail fast on a bad path, before hours of scanning
+    for p in cfg.rs_files.iter().chain(&cfg.rc_files) {
+        File::open(p)
+            .map_err(|e| io::Error::new(e.kind(), format!("cannot open {}: {e}", p.display())))?;
     }
     fs::create_dir_all(&cfg.out_dir)?;
     let mut stats = ExtractStats::default();
 
-    // --- SFT
-    let skipped_sft: Counter = Arc::new(AtomicU64::new(0));
-    let find = |name: &str| paths.iter().find(|p| p.0 == name).unwrap();
-    let (_, es, ec) = find(ELI5);
-    let (_, ns, nc) = find(NSQ);
-    let eli5 = sft_for_sub(es, ec, 800, &skipped_sft)?;
-    let mut nsq = sft_for_sub(ns, nc, 300, &skipped_sft)?;
+    // --- one pass per file; submissions first so comments can find their question
+    let mut scan = Scan::new(cfg.max_pretrain_bytes);
+    for (files, is_sub) in [(&cfg.rs_files, true), (&cfg.rc_files, false)] {
+        for p in files {
+            for_each_line(p, |l| scan.line(l, is_sub))?;
+        }
+    }
+    stats.lines_read = scan.lines_read;
+    stats.lines_kept = scan.lines_kept;
+    stats.skipped = scan.skipped;
+    for (name, n) in SUBS.iter().zip(scan.kept_per_sub) {
+        if n == 0 {
+            eprintln!("warning: no lines for r/{name}");
+            stats.missing_subs.push(name.to_string());
+        }
+    }
+
+    // --- SFT pairs
+    let mut eli5: Vec<(String, i64, SftPair)> = vec![];
+    let mut nsq: Vec<(String, i64, SftPair)> = vec![];
+    for (id, c) in scan.best {
+        let (is_nsq, q) = &scan.questions[&id];
+        let item = (id, c.score, SftPair { q: q.clone(), a: c.answer });
+        if *is_nsq { nsq.push(item) } else { eli5.push(item) }
+    }
+    eli5.sort_by(|a, b| a.0.cmp(&b.0));
     // NSQ must be <= 20% of the total: n <= eli5 / 4. Keep the highest scored.
     nsq.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     nsq.truncate(eli5.len() / 4);
@@ -345,18 +343,11 @@ pub fn run(cfg: &ExtractConfig) -> io::Result<ExtractStats> {
     train.flush()?;
     val.flush()?;
     stats.sft_total = stats.sft_train + stats.sft_val;
-    stats.skipped_sft = skipped_sft.load(Ordering::Relaxed);
 
     // --- pretraining, round-robin across all 6 streams (submissions and
     // comments of each subreddit), so comment bodies appear even when the
     // byte limit is hit long before any submissions stream is exhausted
-    let skipped_pre: Counter = Arc::new(AtomicU64::new(0));
-    let mut sources = Vec::new();
-    for (_, s, c) in &paths {
-        let (subs, coms) = pretrain_docs(s, c, &skipped_pre)?;
-        sources.push(subs);
-        sources.push(coms);
-    }
+    let mut sources: Vec<_> = scan.streams.into_iter().map(Vec::into_iter).collect();
     let mut ptrain = BufWriter::new(File::create(cfg.out_dir.join("pretrain_train.txt"))?);
     let mut pval = BufWriter::new(File::create(cfg.out_dir.join("pretrain_val.txt"))?);
     let mut total: u64 = 0;
@@ -385,6 +376,5 @@ pub fn run(cfg: &ExtractConfig) -> io::Result<ExtractStats> {
     }
     ptrain.flush()?;
     pval.flush()?;
-    stats.skipped_pretrain = skipped_pre.load(Ordering::Relaxed);
     Ok(stats)
 }

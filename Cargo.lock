@@ -103,6 +103,7 @@ version = "0.1.0"
 name = "rllm-prep"
 version = "0.1.0"
 dependencies = [
+ "memchr",
  "rllm",
  "serde",
  "serde_json",
