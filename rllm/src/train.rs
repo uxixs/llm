@@ -272,6 +272,7 @@ fn new_optimizer(p: &Params, args: &Args) -> Optimizer {
 }
 
 pub fn run(args: &Args) -> Result<(), String> {
+    crate::backend::check_supported(args.backend)?;
     let ioe = |what: &str, e: io::Error| format!("{what}: {e}");
     let bpe = Bpe::load(&args.data.join("tokenizer.bin")).map_err(|e| ioe("tokenizer.bin", e))?;
     let mut cfg = Config::baseline();

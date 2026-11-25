@@ -383,6 +383,7 @@ pub fn run_chat(
     err: &mut dyn Write,
 ) -> Result<(), String> {
     let io = |e: std::io::Error| e.to_string();
+    backend::check_supported(args.backend)?;
     if args.kernel == Kernel::Ternary {
         return Err("--kernel ternary is not implemented yet (planned for the ternary-kernel task)".into());
     }
