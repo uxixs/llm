@@ -1,0 +1,7 @@
+[workspace]
+members = ["rllm", "rllm-prep"]
+resolver = "2"
+
+[profile.release]
+debug = 1
+codegen-units = 1
