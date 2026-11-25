@@ -386,9 +386,11 @@ impl Acts {
         }
     }
 
-    /// Main-head softcapped logits `[b·t, V]` of the last `forward_logits` (after `forward`
-    /// they are filled only on Scalar/Blocked, where they are the fused op's scratch).
-    pub fn logits(&self) -> &[f32] {
+    /// Main-head softcapped logits `[b·t, V]` after a Scalar/Blocked `forward` (where they
+    /// are the fused op's scratch). Test-only: on AVX backends `forward` does not fill
+    /// them; use the slice `forward_logits` returns instead.
+    #[cfg(test)]
+    pub(crate) fn logits(&self) -> &[f32] {
         &self.logits[0]
     }
 }

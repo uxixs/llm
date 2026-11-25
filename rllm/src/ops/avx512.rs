@@ -918,7 +918,8 @@ unsafe fn exp_parts(x: __m512) -> (__m512, __m512) {
 }
 
 /// e^x per lane as 2^n * (1 + q) with one final rounding. Max relative error
-/// <= 2e-7 on [-87, 0] (tested); lanes below EXP_MIN return 0.
+/// <= 2e-7 on [-87, 0] (tested); lanes below EXP_MIN return 0; NaN lanes stay
+/// NaN (the clamp in `exp_parts` would otherwise make them finite).
 ///
 /// # Safety
 /// avx512f is available.
@@ -928,12 +929,14 @@ unsafe fn exp_ps(x: __m512) -> __m512 {
     // SAFETY: avx512f is available (caller contract).
     let (s, q) = unsafe { exp_parts(x) };
     let under = _mm512_cmp_ps_mask::<_CMP_LT_OQ>(x, _mm512_set1_ps(EXP_MIN));
-    _mm512_maskz_mov_ps(!under, _mm512_fmadd_ps(s, q, s))
+    let e = _mm512_maskz_mov_ps(!under, _mm512_fmadd_ps(s, q, s));
+    _mm512_mask_mov_ps(e, _mm512_cmp_ps_mask::<_CMP_UNORD_Q>(x, x), x)
 }
 
 /// cap * tanh(x / cap) per lane, via tanh(a) = -m / (2 + m) with
 /// m = expm1(-2|a|) = 2^n*q + (2^n - 1); 2^n - 1 is exact for the n that
 /// matter, so this stays accurate near 0. The sign of x/cap is restored last.
+/// NaN lanes stay NaN, like `f32::tanh` (a diverged run must not look finite).
 ///
 /// # Safety
 /// avx512f is available.
@@ -953,7 +956,9 @@ unsafe fn softcap_ps(x: __m512, cap: __m512) -> __m512 {
         _mm512_add_ps(_mm512_set1_ps(2.0), m),
     );
     let t = _mm512_castsi512_ps(_mm512_or_si512(_mm512_castps_si512(t), sign));
-    _mm512_mul_ps(cap, t)
+    // The clamp in `exp_parts` maps NaN to a finite value; put NaN back.
+    let nan = _mm512_cmp_ps_mask::<_CMP_UNORD_Q>(z, z);
+    _mm512_mask_mov_ps(_mm512_mul_ps(cap, t), nan, z)
 }
 
 thread_local! {
@@ -1526,6 +1531,34 @@ mod tests {
                 let lb = softcap_xent_fwd_bwd_mt(&pool, &mut db, &pre, &tgt, &mask, n, v, 30.0);
                 assert_eq!(lb.to_bits(), la.to_bits(), "pool {size} {n}x{v}: loss");
                 assert_eq!(bits(&db), bits(&da), "pool {size} {n}x{v}: dlogits");
+            }
+        }
+    }
+
+    /// A NaN logit makes the loss NaN (and its row's gradient NaN), as in the
+    /// scalar chain; a diverged run must not report a finite loss.
+    #[test]
+    fn softcap_xent_propagates_nan() {
+        if !have_avx512() {
+            return;
+        }
+        let (n, v, cap) = (3, 37, 30.0);
+        let mut rng = Rng::new(33);
+        let mut pre = randn(&mut rng, n * v);
+        pre[v + 5] = f32::NAN;
+        let tgt: Vec<u16> = vec![1, 2, 3];
+        let mask = vec![1.0; n];
+        let (l0, d0) = softcap_xent_chain(&pre, &tgt, &mask, n, v, cap);
+        assert!(l0.is_nan(), "scalar chain: {l0}");
+        let pool = ThreadPool::new(3);
+        let mut d = vec![0.0; n * v];
+        let l = softcap_xent_fwd_bwd(&mut d, &pre, &tgt, &mask, n, v, cap);
+        let mut dm = vec![0.0; n * v];
+        let lm = softcap_xent_fwd_bwd_mt(&pool, &mut dm, &pre, &tgt, &mask, n, v, cap);
+        for (what, l, d) in [("st", l, &d), ("mt", lm, &dm)] {
+            assert!(l.is_nan(), "{what}: loss {l} should be NaN");
+            for (j, (&g, &r)) in d.iter().zip(&d0).enumerate() {
+                assert_eq!(g.is_nan(), r.is_nan(), "{what}: lane {j}: {g} vs scalar {r}");
             }
         }
     }
