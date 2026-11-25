@@ -337,6 +337,7 @@ pub struct Acts {
 
 impl Acts {
     pub fn new(cfg: &Config, b: usize, t: usize) -> Acts {
+        assert!(t <= cfg.ctx, "t = {t} exceeds ctx = {}", cfg.ctx);
         let (n, d, v) = (b * t, cfg.d, cfg.vocab);
         let z = |len: usize| vec![0.0f32; len];
         let layers = (0..cfg.layers)
@@ -1010,5 +1011,12 @@ mod tests {
             sgd(&mut p, &g, 0.2);
         }
         assert!(loss < 0.1, "loss after training {loss}");
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds ctx")]
+    fn acts_new_rejects_t_over_ctx() {
+        let cfg = tiny_cfg();
+        let _ = Acts::new(&cfg, 1, cfg.ctx + 1);
     }
 }

@@ -22,6 +22,11 @@ impl Rng {
         ((self.next_u64() as u128 * n as u128) >> 64) as usize
     }
 
+    /// Uniform f32 in `[0, 1)` (24 random bits).
+    pub fn uniform(&mut self) -> f32 {
+        (self.next_u64() >> 40) as f32 / (1u32 << 24) as f32
+    }
+
     /// Standard normal sample (Box-Muller).
     pub fn normal(&mut self) -> f32 {
         // u1 in (0, 1] so ln() is finite; u2 in [0, 1).
@@ -70,5 +75,14 @@ mod tests {
         let var = xs.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / n as f32;
         assert!(mean.abs() < 0.05, "mean {mean}");
         assert!((var - 1.0).abs() < 0.08, "var {var}");
+    }
+
+    #[test]
+    fn uniform_in_unit_interval() {
+        let mut r = Rng::new(3);
+        let xs: Vec<f32> = (0..10000).map(|_| r.uniform()).collect();
+        assert!(xs.iter().all(|&x| (0.0..1.0).contains(&x)));
+        let mean = xs.iter().sum::<f32>() / xs.len() as f32;
+        assert!((mean - 0.5).abs() < 0.02, "mean {mean}");
     }
 }

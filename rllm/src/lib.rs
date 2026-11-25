@@ -1,6 +1,7 @@
 pub mod backend;
 pub mod bpe;
 pub mod data;
+pub mod infer;
 pub mod model;
 pub mod optim;
 pub mod rng;

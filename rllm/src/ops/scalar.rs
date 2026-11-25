@@ -194,6 +194,21 @@ pub fn rope_bwd(dx: &mut [f32], b: usize, t: usize, h: usize, d: usize) {
     rope_rotate(dx, b, t, h, d, -1.0);
 }
 
+/// Rotary embedding of ONE position's `[h, d]` vector in place, for KV-cache decoding.
+/// Same convention as `rope_fwd` with `t = pos`.
+pub fn rope_at(x: &mut [f32], h: usize, d: usize, pos: usize) {
+    assert_eq!(x.len(), h * d);
+    for hi in 0..h {
+        for i in 0..d / 2 {
+            let (cos, sin) = rope_angle(pos, i, d);
+            let base = hi * d + 2 * i;
+            let (x0, x1) = (x[base], x[base + 1]);
+            x[base] = x0 * cos - x1 * sin;
+            x[base + 1] = x0 * sin + x1 * cos;
+        }
+    }
+}
+
 fn rope_rotate(x: &mut [f32], b: usize, t: usize, h: usize, d: usize, sign: f32) {
     assert_eq!(x.len(), b * t * h * d);
     for bi in 0..b {
@@ -663,6 +678,20 @@ mod tests {
         attn_bwd(&mut d2, &r, &qkv, &att, AB, AT, AC, AH);
         for (a, b) in d1.iter().zip(&d2) {
             assert!((a + 1.0 - b).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn rope_at_matches_rope_fwd_row() {
+        let (t, h, d) = (7, 3, 8);
+        let mut rng = Rng::new(5);
+        let x = randn(&mut rng, t * h * d);
+        let mut full = x.clone();
+        rope_fwd(&mut full, 1, t, h, d);
+        for pos in 0..t {
+            let mut row = x[pos * h * d..(pos + 1) * h * d].to_vec();
+            rope_at(&mut row, h, d, pos);
+            assert_eq!(&row[..], &full[pos * h * d..(pos + 1) * h * d], "pos {pos}");
         }
     }
 }
