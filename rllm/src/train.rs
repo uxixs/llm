@@ -72,7 +72,8 @@ impl Clock for FakeClock {
 /// Learning-rate multiplier at `frac = elapsed / phase_budget`: linear warmup from 0.1
 /// (so step 0 is not a no-op) to 1.0 over 0..0.05, flat 1.0, linear decay to 0.1 over 0.7..1.0.
 pub fn lr_mult(frac: f64) -> f32 {
-    let f = frac.clamp(0.0, 1.0);
+    // NaN (e.g. 0/0 from a zero budget) must never reach the optimizer.
+    let f = if frac.is_nan() { 0.0 } else { frac.clamp(0.0, 1.0) };
     let m = if f < 0.05 {
         0.1 + 0.9 * f / 0.05
     } else if f <= 0.7 {
@@ -93,8 +94,12 @@ pub struct PhaseStats {
 
 /// Runs `step(lr_mult)` until the budget is used. Before each step the previous step's
 /// duration is the estimate for the next; a step that would overrun is not started, but
-/// at least one step always runs.
+/// at least one step always runs, except when `budget_s <= 0` (or NaN): a zero-length
+/// phase is skipped entirely and runs zero steps.
 pub fn run_phase(clock: &dyn Clock, budget_s: f64, mut step: impl FnMut(f32) -> f32) -> PhaseStats {
+    if !(budget_s > 0.0) {
+        return PhaseStats { steps: 0, last_loss: 0.0, elapsed: 0.0 };
+    }
     let start = clock.now();
     let mut dur = f64::INFINITY;
     let (mut steps, mut last_loss) = (0, 0.0);
@@ -353,7 +358,7 @@ pub fn run(args: &Args) -> Result<(), String> {
         p.num_params(),
         pre_stats.steps,
         sft_stats.steps,
-        (pre_tok + sft_tok) as f64 / wall,
+        if wall > 0.0 { (pre_tok + sft_tok) as f64 / wall } else { 0.0 },
     );
     append_results(&Path::new("runs").join("results.csv"), &row).map_err(|e| ioe("results.csv", e))?;
     println!("train time {wall:.1}s, row appended to runs/results.csv");
@@ -395,6 +400,27 @@ mod tests {
             2.0
         });
         assert_eq!(st.steps, 1);
+    }
+
+    #[test]
+    fn zero_budget_phase_runs_no_steps() {
+        let clock = FakeClock::new();
+        for budget in [0.0, -1.0, f64::NAN] {
+            let mut calls = 0;
+            let st = run_phase(&clock, budget, |_| {
+                calls += 1;
+                1.0
+            });
+            assert_eq!((st.steps, calls, st.elapsed), (0, 0, 0.0));
+        }
+    }
+
+    #[test]
+    fn lr_mult_never_nan() {
+        for f in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0 / 0.0, -3.0] {
+            let m = lr_mult(f);
+            assert!(m.is_finite() && (0.1..=1.0).contains(&m), "{f} -> {m}");
+        }
     }
 
     #[test]
