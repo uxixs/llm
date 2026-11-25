@@ -243,7 +243,7 @@ mod tests {
         let p = dir.join("pre.bin");
         let toks: Vec<u16> = vec![1, 2, 300, 2047];
         std::fs::write(&p, toks.iter().flat_map(|t| t.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
-        assert_eq!(PretrainBatcher::load(&p).unwrap().len(), 4);
+        assert_eq!(PretrainBatcher::load(&p).unwrap().tokens, toks);
 
         let s = dir.join("sft.bin");
         let mut bytes = Vec::new();
@@ -254,7 +254,10 @@ mod tests {
             }
         }
         std::fs::write(&s, &bytes).unwrap();
-        assert_eq!(SftBatcher::load(&s, A, E).unwrap().len(), 2);
+        assert_eq!(
+            SftBatcher::load(&s, A, E).unwrap().records,
+            vec![vec![U, 5, A, 6, E], vec![U, 7, A, 8, 9, E]]
+        );
         bytes.pop();
         std::fs::write(&s, &bytes).unwrap();
         assert!(SftBatcher::load(&s, A, E).is_err());
