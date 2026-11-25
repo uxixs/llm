@@ -1,5 +1,5 @@
 use rllm::infer::{run_chat, ChatArgs, CHAT_USAGE};
-use rllm::tui::{find_latest_model, init_console, list_runs, pick_run, run_tui, Style, CANCEL};
+use rllm::tui::{find_latest_model, init_console, list_runs, pick_run_console, run_tui, Style, CANCEL};
 use std::io::{stderr, stdin, stdout, IsTerminal};
 use std::path::Path;
 use std::process::ExitCode;
@@ -22,7 +22,7 @@ fn main() -> ExitCode {
                 _ => {
                     let s = init_console();
                     style = Some(s);
-                    match pick_run(&runs, &mut stdin().lock(), &mut stdout().lock(), &s) {
+                    match pick_run_console(&runs, &s) {
                         Ok(Some(i)) => Some(runs[i].model.clone()),
                         Ok(None) => return ExitCode::SUCCESS,
                         Err(e) => {

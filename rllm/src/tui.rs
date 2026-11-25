@@ -142,6 +142,48 @@ mod sys {
             SetConsoleCtrlHandler(Some(on_ctrl), 1);
         }
     }
+
+    const STD_INPUT_HANDLE: u32 = -10i32 as u32;
+    const ENABLE_PROCESSED_INPUT: u32 = 0x0001;
+    const ENABLE_LINE_INPUT: u32 = 0x0002;
+    const ENABLE_ECHO_INPUT: u32 = 0x0004;
+    const ENABLE_VIRTUAL_TERMINAL_INPUT: u32 = 0x0200;
+
+    /// Key-at-a-time console input: no line editing or echo, arrow keys arrive as VT
+    /// sequences (`ESC [ A`), Ctrl+C arrives as byte 3. The old mode is restored on drop.
+    pub struct RawInput {
+        h: Handle,
+        old: u32,
+    }
+
+    impl RawInput {
+        pub fn enable() -> Option<RawInput> {
+            // SAFETY: GetStdHandle takes an integer; the handle is only passed back to console
+            // mode calls, and `old` is a writable u32.
+            unsafe {
+                let h = GetStdHandle(STD_INPUT_HANDLE);
+                if h.is_null() || h as isize == -1 {
+                    return None;
+                }
+                let mut old = 0u32;
+                if GetConsoleMode(h, &mut old) == 0 {
+                    return None;
+                }
+                let raw = (old & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT))
+                    | ENABLE_VIRTUAL_TERMINAL_INPUT;
+                (SetConsoleMode(h, raw) != 0).then_some(RawInput { h, old })
+            }
+        }
+    }
+
+    impl Drop for RawInput {
+        fn drop(&mut self) {
+            // SAFETY: restores the mode read from the same console handle in `enable`.
+            unsafe {
+                SetConsoleMode(self.h, self.old);
+            }
+        }
+    }
 }
 
 #[cfg(not(windows))]
@@ -155,6 +197,14 @@ mod sys {
     }
     /// No-op: generation is not cancellable here; Ctrl+C ends the process as usual.
     pub fn install_ctrl_c() {}
+
+    /// Not implemented here: the picker falls back to typing a number.
+    pub struct RawInput;
+    impl RawInput {
+        pub fn enable() -> Option<RawInput> {
+            None
+        }
+    }
 }
 
 /// Set up UTF-8 code pages and the Ctrl+C handler, and decide whether to use colour:
@@ -324,6 +374,8 @@ pub enum Command {
     Temp(f32),
     TopP(f32),
     Model(String),
+    /// Reopen the model picker.
+    Models,
     /// Malformed arguments; carries the message to show.
     Invalid(String),
     Unknown(String),
@@ -360,6 +412,7 @@ pub fn parse_command(line: &str) -> Command {
             Ok(v) => Command::TopP(v),
             Err(e) => Command::Invalid(e),
         },
+        "/models" => Command::Models,
         "/model" if rest.is_empty() => Command::Invalid("usage: /model <path to model.bin>".into()),
         "/model" => Command::Model(rest.to_string()),
         _ => Command::Unknown(cmd.to_string()),
@@ -390,7 +443,12 @@ pub fn fmt_header(
     // Box = "│ " + text + pad + "│": keep it inside the window.
     let max_text = line_width(style).saturating_sub(4).max(24);
     let model_line = {
-        let head = "  model: ";
+        // city name + version, looked up among the runs next to this one
+        let head = match run_title(model) {
+            Some((c, v)) => format!("  model: {c} {v} · "),
+            None => "  model: ".to_string(),
+        };
+        let head = head.as_str();
         let path = model.display().to_string();
         let room = max_text.saturating_sub(str_width(head));
         if str_width(&path) <= room {
@@ -455,13 +513,109 @@ const HELP: &str = "\
 /reset         clear the conversation
 /temp X        sampling temperature, 0..5 (0 = greedy)
 /top_p X       nucleus sampling, (0, 1]
-/model PATH    load another model.bin (same tokenizer)
+/models        back to the model list to switch models
+/model PATH    load another model.bin (its folder's tokenizer if it has one)
 /quit, /exit   leave (also Ctrl+C at the prompt, or Ctrl+Z then Enter)
 Ctrl+C while the assistant is replying stops that reply.";
+
+/// One world city per letter, A to Z. Runs are named by overall rank, worst first, so the
+/// letter climbs as models get better (like Android or Ubuntu releases).
+pub const CITIES: &[&str] = &[
+    "Amsterdam", "Busan", "Cairo", "Dublin", "Edinburgh", "Florence", "Geneva", "Helsinki",
+    "Istanbul", "Jakarta", "Kyoto", "Lisbon", "Madrid", "Nairobi", "Oslo", "Paris", "Quito", "Rome",
+    "Seoul", "Tokyo", "Ulaanbaatar", "Vienna", "Warsaw", "Xian", "Yokohama", "Zurich",
+];
+
+/// City for overall rank `r` (0 = worst); past Z the alphabet repeats with a number.
+pub fn city_for_rank(r: usize) -> String {
+    let base = CITIES[r % CITIES.len()];
+    if r < CITIES.len() {
+        base.to_string()
+    } else {
+        format!("{base} {}", r / CITIES.len() + 1)
+    }
+}
+
+/// Overall rank of each run from its `major.minor` version: worst (lowest) is 0.
+pub fn overall_ranks(versions: &[String]) -> Vec<usize> {
+    let key = |v: &str| {
+        let (a, b) = v.split_once('.').unwrap_or((v, "0"));
+        (a.parse::<u32>().unwrap_or(0), b.parse::<u32>().unwrap_or(0))
+    };
+    let mut order: Vec<usize> = (0..versions.len()).collect();
+    order.sort_by_key(|&i| key(&versions[i]));
+    let mut rank = vec![0; versions.len()];
+    for (r, i) in order.into_iter().enumerate() {
+        rank[i] = r;
+    }
+    rank
+}
+
+/// City name and version of the run that holds `model`, looked up among its sibling runs.
+pub fn run_title(model: &Path) -> Option<(String, String)> {
+    let dir = model.parent()?.parent()?;
+    list_runs(dir).into_iter().find(|r| r.model == model).map(|r| (r.codename, r.version))
+}
+
+/// What `assign_versions` needs to know about one run.
+#[derive(Clone, Copy, Debug)]
+pub struct VersionInput {
+    /// Runs with the same key share a tokenizer, so their losses can be compared.
+    pub family: u64,
+    pub age_s: u64,
+    pub val_pre: Option<f64>,
+    pub val_sft: Option<f64>,
+}
+
+/// `major.minor` per run. Major numbers the families (same tokenizer) in order of their
+/// oldest run, from 1. Minor ranks the runs of a family by mean validation loss: the worst
+/// is `.0`, better runs get higher numbers. A run without losses ranks last; ties go to the
+/// older run first.
+pub fn assign_versions(runs: &[VersionInput]) -> Vec<String> {
+    let score = |r: &VersionInput| {
+        let v: Vec<f64> = [r.val_pre, r.val_sft].into_iter().flatten().collect();
+        if v.is_empty() {
+            f64::INFINITY
+        } else {
+            v.iter().sum::<f64>() / v.len() as f64
+        }
+    };
+    let mut families: Vec<(u64, u64)> = Vec::new(); // (family, oldest age)
+    for r in runs {
+        match families.iter_mut().find(|f| f.0 == r.family) {
+            Some(f) => f.1 = f.1.max(r.age_s),
+            None => families.push((r.family, r.age_s)),
+        }
+    }
+    families.sort_by(|a, b| b.1.cmp(&a.1)); // oldest first
+    let mut out = vec![String::new(); runs.len()];
+    for (fi, (fam, _)) in families.iter().enumerate() {
+        let mut members: Vec<usize> = (0..runs.len()).filter(|&i| runs[i].family == *fam).collect();
+        // worst first: highest loss, then older
+        members.sort_by(|&a, &b| {
+            score(&runs[b]).total_cmp(&score(&runs[a])).then(runs[b].age_s.cmp(&runs[a].age_s))
+        });
+        for (minor, i) in members.into_iter().enumerate() {
+            out[i] = format!("{}.{minor}", fi + 1);
+        }
+    }
+    out
+}
+
+/// FNV-1a of a file's bytes (0 if unreadable).
+fn file_key(path: &Path) -> u64 {
+    std::fs::read(path)
+        .map(|b| b.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &x| (h ^ x as u64).wrapping_mul(0x100_0000_01b3)))
+        .unwrap_or(0)
+}
 
 /// One trained run under `runs/`, for the startup picker.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RunInfo {
+    /// Codename shown to the user (falls back to the folder name).
+    pub codename: String,
+    /// Performance version, e.g. "2.3" (see `assign_versions`).
+    pub version: String,
     pub name: String,
     pub model: PathBuf,
     /// Seconds since `model.bin` was written.
@@ -471,7 +625,7 @@ pub struct RunInfo {
 }
 
 /// Runs with a `model.bin`, newest first, with validation losses from `results.csv`
-/// (the last row for a name wins).
+/// (the last row for a name wins), each with its version and city name.
 pub fn list_runs(dir: &Path) -> Vec<RunInfo> {
     let mut losses = std::collections::HashMap::new();
     if let Ok(csv) = std::fs::read_to_string(dir.join("results.csv")) {
@@ -499,11 +653,28 @@ pub fn list_runs(dir: &Path) -> Vec<RunInfo> {
             let name = e.file_name().to_string_lossy().into_owned();
             let (val_pre, val_sft) = losses.get(&name).copied().unwrap_or((None, None));
             let age_s = now.duration_since(t).map(|d| d.as_secs()).unwrap_or(0);
-            Some((t, RunInfo { name, model, age_s, val_pre, val_sft }))
+            let (codename, version) = (String::new(), String::new());
+            Some((t, RunInfo { codename, version, name, model, age_s, val_pre, val_sft }))
         })
         .collect();
     runs.sort_by(|a, b| b.0.cmp(&a.0));
-    runs.into_iter().map(|(_, r)| r).collect()
+    let mut runs: Vec<RunInfo> = runs.into_iter().map(|(_, r)| r).collect();
+    let inputs: Vec<VersionInput> = runs
+        .iter()
+        .map(|r| VersionInput {
+            family: file_key(&r.model.with_file_name("tokenizer.bin")),
+            age_s: r.age_s,
+            val_pre: r.val_pre,
+            val_sft: r.val_sft,
+        })
+        .collect();
+    let versions = assign_versions(&inputs);
+    let ranks = overall_ranks(&versions);
+    for ((r, v), k) in runs.iter_mut().zip(versions).zip(ranks) {
+        r.version = v;
+        r.codename = city_for_rank(k);
+    }
+    runs
 }
 
 /// `45s`, `12m`, `3h`, `2d`
@@ -516,25 +687,171 @@ pub fn fmt_age(s: u64) -> String {
     }
 }
 
-/// Numbered list of runs for the startup picker; the first (newest) is the default.
-pub fn fmt_run_menu(style: &Style, runs: &[RunInfo]) -> String {
+const PICK_TITLE: &str = "✻ Choose a model";
+const ARROW_HINT: &str = "  ↑/↓ to move · Enter to start · 1-9 to jump · q or Esc to quit";
+
+/// One line per run, the selected one marked with a red `❯` and its name in bold.
+pub fn fmt_run_rows(style: &Style, runs: &[RunInfo], sel: usize) -> String {
+    let title = |r: &RunInfo| if r.version.is_empty() { r.codename.clone() } else { format!("{} {}", r.codename, r.version) };
+    let wcode = runs.iter().map(|r| str_width(&title(r))).max().unwrap_or(0);
     let wname = runs.iter().map(|r| str_width(&r.name)).max().unwrap_or(0);
     let loss = |v: Option<f64>| v.map_or("  -  ".to_string(), |v| format!("{v:.2}"));
-    let mut out = format!("{}\n\n", style.accent("✻ Choose a model"));
+    let mut out = String::new();
     for (i, r) in runs.iter().enumerate() {
-        let marker = if i == 0 { style.accent("❯") } else { " ".to_string() };
-        let pad = " ".repeat(wname - str_width(&r.name));
+        let marker = if i == sel { style.accent("❯") } else { " ".to_string() };
+        let t = title(r);
+        let pad_c = " ".repeat(wcode - str_width(&t));
+        let pad_n = " ".repeat(wname - str_width(&r.name));
         let info = style.dim(&format!(
-            "{:>4} ago · val pretrain {} · sft {}",
+            "{}{pad_n}  {:>4} ago · val pretrain {} · sft {}",
+            r.name,
             fmt_age(r.age_s),
             loss(r.val_pre),
             loss(r.val_sft)
         ));
-        let name = if i == 0 { style.bold(&r.name) } else { r.name.clone() };
-        out.push_str(&format!(" {marker} {:>2}. {name}{pad}  {info}\n", i + 1));
+        let code = if i == sel { style.bold(&t) } else { t.clone() };
+        out.push_str(&format!(" {marker} {:>2}. {code}{pad_c}  {info}\n", i + 1));
     }
+    out
+}
+
+/// Numbered list of runs for the typed-number picker; the first (newest) is the default.
+pub fn fmt_run_menu(style: &Style, runs: &[RunInfo]) -> String {
+    let mut out = format!("{}\n\n", style.accent(PICK_TITLE));
+    out.push_str(&fmt_run_rows(style, runs, 0));
     out.push_str(&format!("\n{}\n", style.dim("  Enter = 1 (newest) · number to pick · q to quit")));
     out
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Key {
+    Up,
+    Down,
+    Home,
+    End,
+    Enter,
+    Digit(u8),
+    Quit,
+    Other,
+}
+
+/// Keys in bytes read from a VT-mode console: `ESC [ A`/`B` (also `ESC O A`, and with
+/// modifiers like `ESC [ 1 ; 5 A`), Home/End, Enter, digits 1-9, `j`/`k`, and quit on
+/// `q`, a lone Esc or Ctrl+C (byte 3).
+pub fn parse_keys(b: &[u8]) -> Vec<Key> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == 0x1b && matches!(b.get(i + 1), Some(b'[') | Some(b'O')) {
+            let mut j = i + 2;
+            while j < b.len() && !(0x40..=0x7e).contains(&b[j]) {
+                j += 1;
+            }
+            out.push(match b.get(j) {
+                Some(b'A') => Key::Up,
+                Some(b'B') => Key::Down,
+                Some(b'H') => Key::Home,
+                Some(b'F') => Key::End,
+                _ => Key::Other,
+            });
+            i = j + 1;
+            continue;
+        }
+        out.push(match b[i] {
+            0x1b | 3 | b'q' | b'Q' => Key::Quit,
+            b'\r' | b'\n' => Key::Enter,
+            b'k' => Key::Up,
+            b'j' => Key::Down,
+            c @ b'1'..=b'9' => Key::Digit(c - b'0'),
+            _ => Key::Other,
+        });
+        i += 1;
+    }
+    out
+}
+
+/// Selection state of the arrow-key picker.
+pub struct Picker {
+    pub sel: usize,
+    n: usize,
+}
+
+impl Picker {
+    pub fn new(n: usize) -> Picker {
+        Picker { sel: 0, n: n.max(1) }
+    }
+
+    /// Some(choice) when the picker is done: Some(Some(i)) picked, Some(None) quit.
+    /// Up/Down wrap around; a digit jumps to that row (Enter confirms).
+    pub fn apply(&mut self, k: Key) -> Option<Option<usize>> {
+        match k {
+            Key::Up => self.sel = (self.sel + self.n - 1) % self.n,
+            Key::Down => self.sel = (self.sel + 1) % self.n,
+            Key::Home => self.sel = 0,
+            Key::End => self.sel = self.n - 1,
+            Key::Digit(d) if (d as usize) <= self.n => self.sel = d as usize - 1,
+            Key::Enter => return Some(Some(self.sel)),
+            Key::Quit => return Some(None),
+            _ => {}
+        }
+        None
+    }
+}
+
+/// Arrow-key picker: draws the list, redraws it in place as the selection moves, and
+/// returns the choice. Ok(None) on quit or end of input. `input` must deliver keys one at
+/// a time (console in raw mode).
+pub fn pick_run_keys(
+    runs: &[RunInfo],
+    input: &mut dyn std::io::Read,
+    out: &mut dyn Write,
+    style: &Style,
+) -> std::io::Result<Option<usize>> {
+    let mut p = Picker::new(runs.len());
+    let draw = |out: &mut dyn Write, sel: usize| -> std::io::Result<()> {
+        write!(out, "{}\n{}\n", fmt_run_rows(style, runs, sel), style.dim(ARROW_HINT))
+    };
+    write!(out, "{}\n\n\x1b[?25l", style.accent(PICK_TITLE))?; // hide the cursor
+    draw(out, p.sel)?;
+    let mut buf = [0u8; 64];
+    let result = loop {
+        out.flush()?;
+        let n = input.read(&mut buf)?;
+        if n == 0 {
+            break None;
+        }
+        let before = p.sel;
+        let mut done = None;
+        for k in parse_keys(&buf[..n]) {
+            if let Some(r) = p.apply(k) {
+                done = Some(r);
+                break;
+            }
+        }
+        if p.sel != before {
+            // back to the first row (rows + blank + hint), clear, redraw
+            write!(out, "\x1b[{}A\r\x1b[J", runs.len() + 2)?;
+            draw(out, p.sel)?;
+        }
+        if let Some(r) = done {
+            break r;
+        }
+    };
+    write!(out, "\x1b[?25h\n")?; // show the cursor again
+    out.flush()?;
+    Ok(result)
+}
+
+/// Startup picker on the real console: arrow keys when the console allows key-at-a-time
+/// input and colour is on, otherwise typing a number.
+pub fn pick_run_console(runs: &[RunInfo], style: &Style) -> std::io::Result<Option<usize>> {
+    let (stdin, stdout) = (std::io::stdin(), std::io::stdout());
+    if style.color {
+        if let Some(_raw) = sys::RawInput::enable() {
+            return pick_run_keys(runs, &mut stdin.lock(), &mut stdout.lock(), style);
+        }
+    }
+    pick_run(runs, &mut stdin.lock(), &mut stdout.lock(), style)
 }
 
 /// Reads the picker answer: empty = first run, `1..=n` = that run, `q` = quit (None).
@@ -637,15 +954,22 @@ impl Chat {
         })
     }
 
-    /// Switch to another model; on any error the current one is untouched.
+    /// Switch to another model, with the tokenizer saved next to it when there is one
+    /// (otherwise the current tokenizer); on any error the current model is untouched.
     pub fn swap_model(&mut self, path: &Path) -> Result<(), String> {
         let (cfg, params) = load_model(path)?;
-        if cfg.vocab != self.bpe.vocab.len() {
-            return Err(format!(
-                "model vocab {} does not match the tokenizer ({})",
-                cfg.vocab,
-                self.bpe.vocab.len()
-            ));
+        let tok = path.parent().map(|d| d.join("tokenizer.bin")).filter(|p| p.is_file());
+        let new_bpe = match &tok {
+            Some(t) => Some(Bpe::load(t).map_err(|e| format!("{}: {e}", t.display()))?),
+            None => None,
+        };
+        let vocab = new_bpe.as_ref().unwrap_or(&self.bpe).vocab.len();
+        if cfg.vocab != vocab {
+            return Err(format!("model vocab {} does not match the tokenizer ({vocab})", cfg.vocab));
+        }
+        if let (Some(b), Some(t)) = (new_bpe, tok) {
+            self.bpe = b;
+            self.args.tokenizer = t;
         }
         self.cache = KvCache::new(&cfg);
         self.cfg = cfg;
@@ -816,6 +1140,39 @@ pub fn run_tui(
                 Err(e) => say(out, &format!("could not load {path}: {e} (keeping the current model)"), true)
                     .map_err(io)?,
             },
+            Command::Models => {
+                let runs = list_runs(Path::new("runs"));
+                if runs.is_empty() {
+                    say(out, "no trained models under runs/", true).map_err(io)?;
+                    continue;
+                }
+                // Arrow keys on a colour console, typed number otherwise (both read `input`).
+                let raw = if style.color { sys::RawInput::enable() } else { None };
+                let choice = if raw.is_some() {
+                    pick_run_keys(&runs, input, out, &style)
+                } else {
+                    pick_run(&runs, input, out, &style)
+                }
+                .map_err(io)?;
+                drop(raw);
+                match choice {
+                    Some(i) => match chat.swap_model(&runs[i].model) {
+                        Ok(()) => {
+                            let header = fmt_header(
+                                &style,
+                                &chat.args.model,
+                                chat.params.num_params(),
+                                &chat.cfg,
+                                chat.args.backend,
+                                chat.args.threads,
+                            );
+                            write!(out, "{header}\n").map_err(io)?;
+                        }
+                        Err(e) => say(out, &format!("could not load {}: {e}", runs[i].codename), true).map_err(io)?,
+                    },
+                    None => say(out, "kept the current model", false).map_err(io)?,
+                }
+            }
             Command::Invalid(msg) => say(out, &msg, true).map_err(io)?,
             Command::Unknown(c) => {
                 say(out, &format!("Unknown command {c}. Type /help for commands."), true).map_err(io)?
@@ -854,6 +1211,7 @@ mod tests {
         ] {
             assert!(matches!(parse_command(bad), Command::Invalid(_)), "{bad}");
         }
+        assert_eq!(parse_command("/models"), Command::Models);
         assert_eq!(parse_command("/frobnicate 1"), Command::Unknown("/frobnicate".into()));
         assert_eq!(parse_command("hello there"), Command::Text("hello there".into()));
         assert_eq!(parse_command("  안녕  "), Command::Text("안녕".into()));
@@ -904,7 +1262,112 @@ mod tests {
         assert_eq!((runs[2].val_pre, runs[2].val_sft), (None, Some(4.5)), "NaN shown as missing");
         assert_eq!(runs[0].model, dir.join("new").join("model.bin"));
         assert!(list_runs(&dir.join("nope")).is_empty());
+        // no tokenizer files: one family; "mid" has no losses so it ranks worst,
+        // then old (4.5), then new (3.455) is best
+        let titles: Vec<String> = runs.iter().map(|r| format!("{} {}", r.codename, r.version)).collect();
+        assert_eq!(titles, ["Cairo 1.2", "Amsterdam 1.0", "Busan 1.1"]);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn versions_by_family_and_loss() {
+        let v = |family, age_s, pre, sft| VersionInput { family, age_s, val_pre: pre, val_sft: sft };
+        let runs = [
+            v(7, 500, Some(7.5), None),       // reddit, oldest overall
+            v(7, 400, Some(4.0), Some(3.7)),  // reddit, best of its family
+            v(9, 300, Some(5.1), Some(3.1)),  // tiny, mean 4.1
+            v(9, 200, Some(2.5), Some(3.2)),  // tiny, mean 2.85 = best
+            v(9, 100, None, None),            // tiny, no losses = worst
+            v(7, 50, Some(6.0), Some(6.0)),   // reddit, newer but worse
+        ];
+        let got = assign_versions(&runs);
+        assert_eq!(got, ["1.0", "1.2", "2.1", "2.2", "2.0", "1.1"]);
+        let ranks = overall_ranks(&got);
+        assert_eq!(ranks, [0, 2, 4, 5, 3, 1]);
+        assert_eq!(city_for_rank(0), "Amsterdam");
+        assert_eq!(city_for_rank(7), "Helsinki");
+        assert_eq!(city_for_rank(26), "Amsterdam 2");
+        for (i, c) in CITIES.iter().enumerate() {
+            assert_eq!(c.as_bytes()[0], b'A' + i as u8, "{c} out of alphabetical order");
+        }
+    }
+
+    #[test]
+    fn swap_model_uses_sibling_tokenizer() {
+        let (dir, model, tok) = tiny_files("swap_a", 9);
+        let mut chat = Chat::load(args(model, tok.clone())).unwrap();
+        // second run: its own folder holds model.bin + tokenizer.bin
+        let dir2 = std::env::temp_dir().join(format!("rllm_tui_swap_b_{}", std::process::id()));
+        std::fs::create_dir_all(&dir2).unwrap();
+        let cfg = tiny_cfg();
+        Params::init(&cfg, &mut Rng::new(3)).save(&cfg, &dir2.join("model.bin")).unwrap();
+        train_bpe(b"other words entirely, other words", 300).save(&dir2.join("tokenizer.bin")).unwrap();
+        chat.history.push((vec![1], vec![2]));
+        chat.swap_model(&dir2.join("model.bin")).unwrap();
+        assert_eq!(chat.args.tokenizer, dir2.join("tokenizer.bin"));
+        assert!(chat.history.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(dir2);
+    }
+
+    #[test]
+    fn keys_parsed() {
+        use Key::*;
+        assert_eq!(parse_keys(b"\x1b[A\x1b[B"), vec![Up, Down]);
+        assert_eq!(parse_keys(b"\x1bOA\x1b[1;5B\x1b[H\x1b[F"), vec![Up, Down, Home, End]);
+        assert_eq!(parse_keys(b"\r"), vec![Enter]);
+        assert_eq!(parse_keys(b"kj3"), vec![Up, Down, Digit(3)]);
+        assert_eq!(parse_keys(b"\x1b"), vec![Quit], "lone Esc");
+        assert_eq!(parse_keys(b"\x03"), vec![Quit], "Ctrl+C");
+        assert_eq!(parse_keys(b"q"), vec![Quit]);
+        assert_eq!(parse_keys(b"x0\x1b[C"), vec![Other, Other, Other]);
+    }
+
+    #[test]
+    fn picker_moves_and_wraps() {
+        let mut p = Picker::new(3);
+        assert_eq!(p.apply(Key::Up), None);
+        assert_eq!(p.sel, 2, "wraps to the last row");
+        p.apply(Key::Down);
+        assert_eq!(p.sel, 0);
+        p.apply(Key::Digit(2));
+        assert_eq!(p.sel, 1);
+        p.apply(Key::Digit(9));
+        assert_eq!(p.sel, 1, "out-of-range digit ignored");
+        p.apply(Key::End);
+        assert_eq!(p.sel, 2);
+        p.apply(Key::Home);
+        assert_eq!(p.apply(Key::Enter), Some(Some(0)));
+        assert_eq!(Picker::new(3).apply(Key::Quit), Some(None));
+    }
+
+    fn two_runs() -> Vec<RunInfo> {
+        vec![
+            RunInfo { codename: "Cairo".into(), version: "1.2".into(), name: "a".into(), model: "runs/a/model.bin".into(), age_s: 1, val_pre: None, val_sft: None },
+            RunInfo { codename: "Busan".into(), version: "1.1".into(), name: "b".into(), model: "runs/b/model.bin".into(), age_s: 2, val_pre: None, val_sft: None },
+            RunInfo { codename: "Amsterdam".into(), version: "1.0".into(), name: "c".into(), model: "runs/c/model.bin".into(), age_s: 3, val_pre: None, val_sft: None },
+        ]
+    }
+
+    #[test]
+    fn arrow_picker_scripted() {
+        let runs = two_runs();
+        let s = Style { color: false };
+        let rows = fmt_run_rows(&s, &runs, 1);
+        assert!(rows.lines().nth(1).unwrap().contains("❯  2. Busan 1.1      b"), "{rows}");
+        assert!(!rows.lines().next().unwrap().contains('❯'));
+        // down, down, up, Enter -> row 2 (index 1); keys may arrive in one read
+        let mut out = Vec::new();
+        let mut input = std::io::Cursor::new(b"\x1b[B\x1b[B\x1b[A\r".to_vec());
+        assert_eq!(pick_run_keys(&runs, &mut input, &mut out, &s).unwrap(), Some(1));
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("\x1b[5A"), "redraw moves up rows + 2: {out:?}");
+        assert!(out.contains("\x1b[?25l") && out.ends_with("\x1b[?25h\n"), "cursor hidden then shown");
+        // Esc quits, end of input quits
+        let mut esc = std::io::Cursor::new(b"\x1b".to_vec());
+        assert_eq!(pick_run_keys(&runs, &mut esc, &mut Vec::new(), &s).unwrap(), None);
+        let mut eof = std::io::Cursor::new(Vec::new());
+        assert_eq!(pick_run_keys(&runs, &mut eof, &mut Vec::new(), &s).unwrap(), None);
     }
 
     #[test]
@@ -922,13 +1385,13 @@ mod tests {
     #[test]
     fn picker_menu_and_retry() {
         let runs = vec![
-            RunInfo { name: "tiny-mem".into(), model: "runs/tiny-mem/model.bin".into(), age_s: 90, val_pre: Some(2.56), val_sft: Some(3.2) },
-            RunInfo { name: "reddit".into(), model: "runs/reddit/model.bin".into(), age_s: 7200, val_pre: None, val_sft: None },
+            RunInfo { codename: "Istanbul".into(), version: "2.4".into(), name: "tiny-mem".into(), model: "runs/tiny-mem/model.bin".into(), age_s: 90, val_pre: Some(2.56), val_sft: Some(3.2) },
+            RunInfo { codename: "Dublin".into(), version: "1.3".into(), name: "reddit".into(), model: "runs/reddit/model.bin".into(), age_s: 7200, val_pre: None, val_sft: None },
         ];
         let s = Style { color: false };
         let menu = fmt_run_menu(&s, &runs);
         assert!(!menu.contains('\x1b'));
-        for want in ["1. tiny-mem", "2. reddit", "1m ago", "2h ago", "2.56", "3.20", "Enter = 1"] {
+        for want in ["1. Istanbul 2.4", "2. Dublin 1.3", "tiny-mem", "reddit", "1m ago", "2h ago", "2.56", "3.20", "Enter = 1"] {
             assert!(menu.contains(want), "missing {want:?} in {menu}");
         }
         let mut out = Vec::new();
