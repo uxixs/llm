@@ -7,6 +7,7 @@ pub mod model;
 pub mod optim;
 pub mod pool;
 pub mod rng;
+pub mod tui;
 
 pub mod ops;
 #[cfg(test)]

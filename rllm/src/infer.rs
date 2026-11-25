@@ -349,14 +349,35 @@ fn generate_with(
     rng: &mut Rng,
     on_text: &mut dyn FnMut(&str) -> std::io::Result<()>,
 ) -> std::io::Result<(Vec<u16>, f64)> {
+    let never = std::sync::atomic::AtomicBool::new(false);
+    generate_cancellable(stepper, ctx, args, bpe, prompt, rng, &never, on_text)
+}
+
+/// `generate_with` that also stops (keeping the partial reply) as soon as `cancel` is set,
+/// checked before every step including prompt prefill.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_cancellable(
+    stepper: &mut dyn FnMut(u16, usize) -> Vec<f32>,
+    ctx: usize,
+    args: &ChatArgs,
+    bpe: &Bpe,
+    prompt: &[u16],
+    rng: &mut Rng,
+    cancel: &std::sync::atomic::AtomicBool,
+    on_text: &mut dyn FnMut(&str) -> std::io::Result<()>,
+) -> std::io::Result<(Vec<u16>, f64)> {
+    use std::sync::atomic::Ordering::Relaxed;
     let mut logits = Vec::new();
     for (pos, &t) in prompt.iter().enumerate() {
+        if cancel.load(Relaxed) {
+            return Ok((Vec::new(), 0.0));
+        }
         logits = stepper(t, pos);
     }
     let t0 = Instant::now();
     let (mut pos, mut reply, mut dec) = (prompt.len(), Vec::new(), StreamDecoder::new());
     let specials = [bpe.user(), bpe.assistant(), bpe.end()];
-    while pos < ctx {
+    while pos < ctx && !cancel.load(Relaxed) {
         let tok = sample(&logits, args.temp, args.top_p, rng);
         if specials.contains(&tok) {
             break;
