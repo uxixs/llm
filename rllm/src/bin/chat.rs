@@ -21,6 +21,16 @@ fn main() -> ExitCode {
             }
         }
     }
+    // A run folder keeps the tokenizer it was trained with; prefer it over data/.
+    if !argv.iter().any(|a| a == "--tokenizer") {
+        let model = argv.iter().position(|a| a == "--model").and_then(|i| argv.get(i + 1));
+        if let Some(tok) = model.and_then(|m| Path::new(m).parent()).map(|d| d.join("tokenizer.bin")) {
+            if tok.is_file() {
+                argv.push("--tokenizer".into());
+                argv.push(tok.to_string_lossy().into_owned());
+            }
+        }
+    }
     let args = match ChatArgs::parse(argv.into_iter()) {
         Ok(a) => a,
         Err(e) => {
