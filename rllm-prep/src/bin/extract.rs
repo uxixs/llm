@@ -2,8 +2,8 @@ use rllm_prep::extract::{run, ExtractConfig};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-const USAGE: &str = "usage: extract --rs <RS_*.zst>... --rc <RC_*.zst>... [--out data] [--max-pretrain-mb 40]\n\
-  --rs/--rc take one or more paths each (several values or repeated flags)";
+const USAGE: &str = "usage: extract --rs <posts.zst|.jsonl>... --rc <comments.zst|.jsonl>... [--out data] [--max-pretrain-mb 40]\n\
+  --rs/--rc accept .zst (Pushshift) and .jsonl (plain, e.g. Arctic Shift); one or more paths each (several values or repeated flags)";
 
 fn main() -> ExitCode {
     let mut rs: Vec<PathBuf> = vec![];

@@ -24,14 +24,30 @@ pub struct SftPair {
 
 // ---------------------------------------------------------------- reading
 
-/// Streams every non-blank line of a zstd file to `f` (one pass, constant
-/// memory). A read error mid-stream (truncated file) warns and stops this file.
-pub fn for_each_line(path: &Path, mut f: impl FnMut(&[u8])) -> io::Result<()> {
+/// Opens `path` as a line source: `.zst` is zstd-decoded (Pushshift monthly
+/// dumps), anything else (e.g. Arctic Shift `.jsonl`) is read as plain text.
+fn open_reader(path: &Path) -> io::Result<Box<dyn BufRead>> {
     let file = File::open(path)
         .map_err(|e| io::Error::new(e.kind(), format!("cannot open {}: {e}", path.display())))?;
-    let mut dec = zstd::stream::Decoder::new(file)?;
-    dec.window_log_max(31)?; // Pushshift dumps use long-window zstd
-    let mut reader = BufReader::with_capacity(1 << 20, dec);
+    let is_zst = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("zst"));
+    Ok(if is_zst {
+        let mut dec = zstd::stream::Decoder::new(file)?;
+        dec.window_log_max(31)?; // Pushshift dumps use long-window zstd
+        Box::new(BufReader::with_capacity(1 << 20, dec))
+    } else {
+        Box::new(BufReader::with_capacity(1 << 20, file))
+    })
+}
+
+/// Streams every non-blank line of a `.zst` or plain-text file to `f` (one
+/// pass, constant memory).
+pub fn for_each_line(path: &Path, f: impl FnMut(&[u8])) -> io::Result<()> {
+    stream_lines(open_reader(path)?, path, f)
+}
+
+/// The single line loop. A read error mid-stream (truncated file) warns and
+/// stops this file.
+fn stream_lines(mut reader: Box<dyn BufRead>, path: &Path, mut f: impl FnMut(&[u8])) -> io::Result<()> {
     let mut buf = Vec::new();
     loop {
         buf.clear();
@@ -262,9 +278,9 @@ impl Scan {
 
 #[derive(Debug, Clone)]
 pub struct ExtractConfig {
-    /// Monthly submission files (`RS_YYYY-MM.zst`), read before the comments.
+    /// Submission files (`RS_YYYY-MM.zst` or plain `.jsonl`), read before the comments.
     pub rs_files: Vec<PathBuf>,
-    /// Monthly comment files (`RC_YYYY-MM.zst`).
+    /// Comment files (`RC_YYYY-MM.zst` or plain `.jsonl`).
     pub rc_files: Vec<PathBuf>,
     pub out_dir: PathBuf,
     pub max_pretrain_bytes: u64,

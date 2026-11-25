@@ -387,3 +387,52 @@ fn pretrain_includes_comments_when_submissions_exceed_limit() {
     assert!(text.contains("COMMENTBODY"), "no comment bodies in pretrain output");
     assert!(text.contains("title "));
 }
+
+fn read_all(out: &Path) -> Vec<String> {
+    ["sft_train.jsonl", "sft_val.jsonl", "pretrain_train.txt", "pretrain_val.txt"]
+        .iter()
+        .map(|f| fs::read_to_string(out.join(f)).unwrap())
+        .collect()
+}
+
+#[test]
+fn plain_jsonl_input_matches_zst() {
+    let rs = vec![sub("a1", ELI5, "Why is the sky blue", "please explain"), sub("a2", NSQ, "Why yawn", "")];
+    let rc = vec![
+        com("c1", ELI5, "a1", "t3_a1", &ans(1), 50, "bob"),
+        com("c2", NSQ, "a2", "t3_a2", &ans(2), 40, "amy"),
+    ];
+    let d = tmp("plain_vs_zst");
+    let (zs, zc) = (d.join("RS.zst"), d.join("RC.zst"));
+    write_zst(&zs, &rs);
+    write_zst(&zc, &rc);
+    let (js, jc) = (d.join("posts.jsonl"), d.join("comments.jsonl"));
+    fs::write(&js, rs.join("\n") + "\n").unwrap();
+    fs::write(&jc, rc.join("\n") + "\n").unwrap();
+    let (oz, sz) = run_files(vec![zs], vec![zc], "plain_zst", 40 * MB);
+    let (oj, sj) = run_files(vec![js], vec![jc], "plain_jsonl", 40 * MB);
+    assert_eq!(sz.lines_read, 4);
+    assert_eq!(sj.lines_read, sz.lines_read);
+    assert_eq!(sj.lines_kept, sz.lines_kept);
+    assert!(sj.sft_total >= 1);
+    assert_eq!(read_all(&oj), read_all(&oz));
+}
+
+#[test]
+fn meta_key_line_parsed() {
+    let post = format!(
+        r#"{{"_meta":{{"source":"arctic_shift","retrieved_on":1700000000}},"id":"m1","subreddit":"{ELI5}","title":"Why meta","selftext":"body here","score":5,"author":"u"}}"#
+    );
+    let comment = format!(
+        r#"{{"_meta":{{"source":"arctic_shift"}},"id":"mc1","subreddit":"{ELI5}","link_id":"t3_m1","parent_id":"t3_m1","body":"{}","score":30,"author":"bob"}}"#,
+        ans(9)
+    );
+    let d = tmp("meta_key");
+    let (s, c) = (d.join("p.jsonl"), d.join("c.jsonl"));
+    fs::write(&s, post + "\n").unwrap();
+    fs::write(&c, comment + "\n").unwrap();
+    let (out, st) = run_files(vec![s], vec![c], "meta_key", 40 * MB);
+    assert_eq!(st.lines_kept, 2);
+    assert_eq!(st.skipped, 0);
+    assert_eq!(all_sft(&out).len(), 1);
+}
