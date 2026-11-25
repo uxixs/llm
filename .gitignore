@@ -1,4 +1,6 @@
 target/
 data/
 runs/
+raw/
+data-*/
 .superpowers/

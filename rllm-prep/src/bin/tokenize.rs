@@ -10,24 +10,50 @@ const DOC_SEP: &[u8] = b"\n\x1e\n";
 /// Context (256) + 1: longest SFT record kept.
 const MAX_SFT_LEN: usize = 257;
 
+/// One `sft_*.jsonl` line: a single-turn pair or a multi-turn dialogue
+/// (turns alternate user, assistant, user, ...).
 #[derive(Deserialize)]
-struct Pair {
-    q: String,
-    a: String,
+#[serde(untagged)]
+enum SftLine {
+    Pair { q: String, a: String },
+    Turns { turns: Vec<String> },
 }
 
 /// `<|user|> q <|assistant|> a <|end|>`; None if the answer is empty or the record
 /// is longer than `max_len` tokens.
 fn encode_sft_record(bpe: &Bpe, q: &str, a: &str, max_len: usize) -> Option<Vec<u16>> {
-    if a.trim().is_empty() {
-        return None;
+    encode_sft_turns(bpe, &[q.to_string(), a.to_string()], max_len)
+}
+
+/// `<|user|> t0 <|assistant|> t1 <|end|> <|user|> t2 <|assistant|> t3 <|end|> ...`.
+/// Keeps whole (user, assistant) pairs from the start while the record fits in
+/// `max_len` tokens; stops at the first empty assistant turn or a trailing odd turn.
+/// None if not even the first pair fits.
+fn encode_sft_turns(bpe: &Bpe, turns: &[String], max_len: usize) -> Option<Vec<u16>> {
+    let mut rec = Vec::new();
+    for pair in turns.chunks_exact(2) {
+        if pair[1].trim().is_empty() {
+            break;
+        }
+        let mut p = vec![bpe.user()];
+        p.extend(bpe.encode(pair[0].as_bytes()));
+        p.push(bpe.assistant());
+        p.extend(bpe.encode(pair[1].as_bytes()));
+        p.push(bpe.end());
+        if rec.len() + p.len() > max_len {
+            break;
+        }
+        rec.extend(p);
     }
-    let mut rec = vec![bpe.user()];
-    rec.extend(bpe.encode(q.as_bytes()));
-    rec.push(bpe.assistant());
-    rec.extend(bpe.encode(a.as_bytes()));
-    rec.push(bpe.end());
-    (rec.len() <= max_len).then_some(rec)
+    (!rec.is_empty()).then_some(rec)
+}
+
+/// Err for a malformed line, Ok(None) for a record that is dropped.
+fn encode_sft_line(bpe: &Bpe, line: &str, max_len: usize) -> Result<Option<Vec<u16>>, serde_json::Error> {
+    Ok(match serde_json::from_str::<SftLine>(line)? {
+        SftLine::Pair { q, a } => encode_sft_record(bpe, &q, &a, max_len),
+        SftLine::Turns { turns } => encode_sft_turns(bpe, &turns, max_len),
+    })
 }
 
 /// Documents (split on `\n\x1e\n`) encoded and each followed by `<|end|>`.
@@ -69,11 +95,11 @@ fn encode_sft_file(bpe: &Bpe, path: &Path) -> io::Result<(Vec<u8>, usize, usize,
         if line.trim().is_empty() {
             continue;
         }
-        let Ok(p) = serde_json::from_str::<Pair>(&line) else {
+        let Ok(rec) = encode_sft_line(bpe, &line, MAX_SFT_LEN) else {
             bad += 1;
             continue;
         };
-        match encode_sft_record(bpe, &p.q, &p.a, MAX_SFT_LEN) {
+        match rec {
             Some(rec) => {
                 bytes.extend_from_slice(&(rec.len() as u16).to_le_bytes());
                 for t in rec {
@@ -179,6 +205,50 @@ mod tests {
         let long = "x".repeat(257 - 2);
         assert!(encode_sft_record(&b, "", &long, 257).is_none());
         assert!(encode_sft_record(&b, &"y".repeat(1000), "a", 257).is_none());
+    }
+
+    #[test]
+    fn turns_record_layout() {
+        let b = bpe();
+        let t: Vec<String> = ["hello", "world", "there", "hello"].iter().map(|s| s.to_string()).collect();
+        let r = encode_sft_turns(&b, &t, 257).unwrap();
+        let (u, a, e) = (b.user(), b.assistant(), b.end());
+        assert_eq!(r.iter().filter(|&&x| x == u).count(), 2);
+        assert_eq!(r.iter().filter(|&&x| x == a).count(), 2);
+        assert_eq!(r.iter().filter(|&&x| x == e).count(), 2);
+        let mut want = vec![u];
+        for (i, s) in t.iter().enumerate() {
+            want.extend(b.encode(s.as_bytes()));
+            want.push(if i % 2 == 0 { a } else { e });
+            if i == 1 {
+                want.push(u);
+            }
+        }
+        assert_eq!(r, want);
+    }
+
+    #[test]
+    fn turns_truncated_to_whole_pairs() {
+        let b = bpe();
+        let long = "x".repeat(260);
+        let t = vec!["hi".to_string(), "hello".to_string(), "q".to_string(), long];
+        let r = encode_sft_turns(&b, &t, 257).unwrap();
+        assert_eq!(r, encode_sft_record(&b, "hi", "hello", 257).unwrap());
+        // first pair alone too long: dropped
+        assert!(encode_sft_turns(&b, &["y".repeat(300), "a".to_string()], 257).is_none());
+        // empty assistant turn ends the record
+        let t = vec!["hi".to_string(), "hello".to_string(), "q".to_string(), " ".to_string()];
+        assert_eq!(encode_sft_turns(&b, &t, 257).unwrap(), encode_sft_record(&b, "hi", "hello", 257).unwrap());
+    }
+
+    #[test]
+    fn jsonl_line_formats() {
+        let b = bpe();
+        let p = encode_sft_line(&b, r#"{"q":"hello","a":"world"}"#, 257).unwrap().unwrap();
+        assert_eq!(p, encode_sft_record(&b, "hello", "world", 257).unwrap());
+        let t = encode_sft_line(&b, r#"{"turns":["hello","world"]}"#, 257).unwrap().unwrap();
+        assert_eq!(t, p);
+        assert!(encode_sft_line(&b, "not json", 257).is_err());
     }
 
     #[test]
