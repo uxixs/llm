@@ -1,5 +1,6 @@
-//! AVX-512 matmul and attention kernels (single-threaded). Same signatures and
-//! semantics as `ops::scalar`. Requires avx512f only (masked loads/stores, FMA,
+//! AVX-512 matmul and attention kernels. Same signatures and semantics as
+//! `ops::scalar`; the `*_mt` variants (end of file) take a `&ThreadPool` first
+//! and are bit-identical to the single-threaded ones. Requires avx512f only (masked loads/stores, FMA,
 //! horizontal reduce); each public fn asserts it at runtime.
 //!
 //! # Matmul microkernel
@@ -26,9 +27,9 @@
 //! contiguous row range of `out` / `dx` / `dw`, so a caller can hand disjoint
 //! `chunks_mut` to threads. `matmul_fwd` packs W into a thread-local buffer; a
 //! parallel caller should `pack_wt` once and share the panels read-only.
-//! Attention splits by batch: out, att, qkv, dout and dqkv for batches b0..b1
-//! are contiguous sub-slices, so `attn_fwd` / `attn_bwd` can be called on them
-//! directly.
+//! Attention is computed per (batch, head) by `attn_fwd_head` /
+//! `attn_bwd_head`; each pair owns a disjoint region of out / att / dqkv, so
+//! `attn_*_mt` split over b*h (batch-only splits also work on sub-slices).
 //!
 //! # Scratch
 //! `matmul_fwd` reuses a `thread_local!` pack buffer (grows to the largest
@@ -38,6 +39,8 @@
 
 use std::arch::x86_64::*;
 use std::cell::RefCell;
+
+use crate::pool::ThreadPool;
 
 /// f32 lanes per zmm.
 const L: usize = 16;
@@ -499,38 +502,63 @@ pub fn attn_fwd(
     h: usize,
 ) {
     let d = attn_check(qkv, att, out.len(), b, t, c, h);
+    let op = out.as_mut_ptr();
+    for bh in 0..b * h {
+        let att_bh = &mut att[bh * t * t..][..t * t];
+        // SAFETY: shapes checked by attn_check; `op` covers all of `out`, which
+        // is exclusively borrowed here and distinct from qkv and att.
+        unsafe { attn_fwd_head(op, att_bh, qkv, bh / h, bh % h, t, c, d) };
+    }
+}
+
+/// One (batch bi, head hi) of `attn_fwd`: fills `att_bh` (that head's `[t,t]`
+/// block of att) and out columns hi*d..hi*d+d of batch bi's t rows.
+///
+/// # Safety
+/// avx512f is available; shapes were validated by `attn_check` (qkv is
+/// `[b,t,3c]`, bi < b, hi < h, d = c/h); `out` points to a writable `[b,t,c]`
+/// buffer that overlaps neither qkv nor att_bh, and no other thread accesses
+/// the (bi, hi) out region during the call.
+#[allow(clippy::too_many_arguments)]
+unsafe fn attn_fwd_head(
+    out: *mut f32,
+    att_bh: &mut [f32],
+    qkv: &[f32],
+    bi: usize,
+    hi: usize,
+    t: usize,
+    c: usize,
+    d: usize,
+) {
     let scale = 1.0 / (d as f32).sqrt();
     let c3 = 3 * c;
     let qp = qkv.as_ptr();
-    for bi in 0..b {
-        for hi in 0..h {
-            for tq in 0..t {
-                let q_off = (bi * t + tq) * c3 + hi * d;
-                let row = &mut att[((bi * h + hi) * t + tq) * t..][..t];
-                let mut max = f32::NEG_INFINITY;
-                for (s, r) in row[..=tq].iter_mut().enumerate() {
-                    let k_off = (bi * t + s) * c3 + c + hi * d;
-                    // SAFETY: avx512f checked; hi*d + d <= c and each token row
-                    // has 3c values, so q_off + d and k_off + d <= qkv.len().
-                    *r = unsafe { dot(qp.add(q_off), qp.add(k_off), d) } * scale;
-                    max = max.max(*r);
-                }
-                let mut sum = 0.0;
-                for p in &mut row[..=tq] {
-                    *p = (*p - max).exp();
-                    sum += *p;
-                }
-                for p in &mut row[..=tq] {
-                    *p /= sum;
-                }
-                row[tq + 1..].fill(0.0);
-                let o = &mut out[(bi * t + tq) * c + hi * d..][..d];
-                let v0 = bi * t * c3 + 2 * c + hi * d;
-                // SAFETY: avx512f checked; o has d values; v rows s <= tq < t at
-                // v0 + s*c3 .. +d are inside qkv; out and qkv are distinct slices.
-                unsafe { weighted_sum(o.as_mut_ptr(), false, &row[..=tq], qp.add(v0), c3, d) };
-            }
+    for tq in 0..t {
+        let q_off = (bi * t + tq) * c3 + hi * d;
+        let row = &mut att_bh[tq * t..][..t];
+        let mut max = f32::NEG_INFINITY;
+        for (s, r) in row[..=tq].iter_mut().enumerate() {
+            let k_off = (bi * t + s) * c3 + c + hi * d;
+            // SAFETY: avx512f available; hi*d + d <= c and each token row
+            // has 3c values, so q_off + d and k_off + d <= qkv.len().
+            *r = unsafe { dot(qp.add(q_off), qp.add(k_off), d) } * scale;
+            max = max.max(*r);
         }
+        let mut sum = 0.0;
+        for p in &mut row[..=tq] {
+            *p = (*p - max).exp();
+            sum += *p;
+        }
+        for p in &mut row[..=tq] {
+            *p /= sum;
+        }
+        row[tq + 1..].fill(0.0);
+        let o_off = (bi * t + tq) * c + hi * d;
+        let v0 = bi * t * c3 + 2 * c + hi * d;
+        // SAFETY: avx512f available; o_off + d <= b*t*c, inside out (caller
+        // contract), and in the (bi, hi) region this call owns; v rows
+        // s <= tq < t at v0 + s*c3 .. +d are inside qkv, distinct from out.
+        unsafe { weighted_sum(out.add(o_off), false, &row[..=tq], qp.add(v0), c3, d) };
     }
 }
 
@@ -548,53 +576,303 @@ pub fn attn_bwd(
 ) {
     let d = attn_check(qkv, att, dout.len(), b, t, c, h);
     assert_eq!(dqkv.len(), qkv.len());
-    let scale = 1.0 / (d as f32).sqrt();
-    let c3 = 3 * c;
-    let qp = qkv.as_ptr();
     let gp = dqkv.as_mut_ptr();
     DS.with(|buf| {
         let mut buf = buf.borrow_mut();
         if buf.len() < t {
             buf.resize(t, 0.0);
         }
-        for bi in 0..b {
-            for hi in 0..h {
-                for tq in 0..t {
-                    let q_off = (bi * t + tq) * c3 + hi * d;
-                    let do_ = &dout[(bi * t + tq) * c + hi * d..][..d];
-                    let p = &att[((bi * h + hi) * t + tq) * t..][..=tq];
-                    let ds = &mut buf[..=tq];
-                    // dp[s] = dout . v_s; dv_s += p[s] * dout.
-                    let mut pdp = 0.0;
-                    for (s, (dsv, &ps)) in ds.iter_mut().zip(p).enumerate() {
-                        let v_off = (bi * t + s) * c3 + 2 * c + hi * d;
-                        // SAFETY: avx512f checked; v_off + d <= qkv.len() ==
-                        // dqkv.len(); do_ lives in dout, distinct from dqkv.
-                        let dp = unsafe {
-                            axpy(gp.add(v_off), ps, do_.as_ptr(), d);
-                            dot(do_.as_ptr(), qp.add(v_off), d)
-                        };
-                        *dsv = dp;
-                        pdp += ps * dp;
-                    }
-                    // Softmax Jacobian: ds = p * (dp - sum(p*dp)) * scale.
-                    for (dsv, &ps) in ds.iter_mut().zip(p) {
-                        *dsv = ps * (*dsv - pdp) * scale;
-                    }
-                    let k0 = bi * t * c3 + c + hi * d;
-                    // SAFETY: avx512f checked. dq at q_off..+d and dk rows at
-                    // k0 + s*c3 ..+d (s <= tq < t) are inside dqkv; all reads are
-                    // from qkv, a distinct slice, and dq (cols < c) never overlaps
-                    // a dk row (cols c..2c).
-                    unsafe {
-                        weighted_sum(gp.add(q_off), true, ds, qp.add(k0), c3, d);
-                        for (s, &dsv) in ds.iter().enumerate() {
-                            axpy(gp.add(k0 + s * c3), dsv, qp.add(q_off), d);
-                        }
-                    }
-                }
+        for bh in 0..b * h {
+            // SAFETY: shapes checked; `gp` covers all of `dqkv`, which is
+            // exclusively borrowed here and distinct from dout, qkv and att.
+            unsafe {
+                attn_bwd_head(
+                    gp,
+                    &mut buf[..t],
+                    dout,
+                    qkv,
+                    att,
+                    bh / h,
+                    bh % h,
+                    t,
+                    c,
+                    h,
+                    d,
+                )
+            };
+        }
+    });
+}
+
+/// One (batch bi, head hi) of `attn_bwd`. Accumulates into the q, k and v
+/// columns hi*d..hi*d+d of batch bi's t rows of dqkv. `ds` is length-t scratch.
+///
+/// # Safety
+/// avx512f is available; shapes were validated by `attn_check` and
+/// dqkv.len() == qkv.len() (bi < b, hi < h, d = c/h); `dqkv` points to a
+/// writable `[b,t,3c]` buffer that overlaps none of ds, dout, qkv, att, and no
+/// other thread accesses the (bi, hi) dqkv region during the call.
+#[allow(clippy::too_many_arguments)]
+unsafe fn attn_bwd_head(
+    dqkv: *mut f32,
+    ds_buf: &mut [f32],
+    dout: &[f32],
+    qkv: &[f32],
+    att: &[f32],
+    bi: usize,
+    hi: usize,
+    t: usize,
+    c: usize,
+    h: usize,
+    d: usize,
+) {
+    let scale = 1.0 / (d as f32).sqrt();
+    let c3 = 3 * c;
+    let qp = qkv.as_ptr();
+    let gp = dqkv;
+    for tq in 0..t {
+        let q_off = (bi * t + tq) * c3 + hi * d;
+        let do_ = &dout[(bi * t + tq) * c + hi * d..][..d];
+        let p = &att[((bi * h + hi) * t + tq) * t..][..=tq];
+        let ds = &mut ds_buf[..=tq];
+        // dp[s] = dout . v_s; dv_s += p[s] * dout.
+        let mut pdp = 0.0;
+        for (s, (dsv, &ps)) in ds.iter_mut().zip(p).enumerate() {
+            let v_off = (bi * t + s) * c3 + 2 * c + hi * d;
+            // SAFETY: avx512f available; v_off + d <= qkv.len() == dqkv
+            // len, in the (bi, hi) region; do_ lives in dout, distinct.
+            let dp = unsafe {
+                axpy(gp.add(v_off), ps, do_.as_ptr(), d);
+                dot(do_.as_ptr(), qp.add(v_off), d)
+            };
+            *dsv = dp;
+            pdp += ps * dp;
+        }
+        // Softmax Jacobian: ds = p * (dp - sum(p*dp)) * scale.
+        for (dsv, &ps) in ds.iter_mut().zip(p) {
+            *dsv = ps * (*dsv - pdp) * scale;
+        }
+        let k0 = bi * t * c3 + c + hi * d;
+        // SAFETY: avx512f available. dq at q_off..+d and dk rows at
+        // k0 + s*c3 ..+d (s <= tq < t) are inside dqkv and the (bi, hi)
+        // region; all reads are from qkv, a distinct slice, and dq (cols < c)
+        // never overlaps a dk row (cols c..2c).
+        unsafe {
+            weighted_sum(gp.add(q_off), true, ds, qp.add(k0), c3, d);
+            for (s, &dsv) in ds.iter().enumerate() {
+                axpy(gp.add(k0 + s * c3), dsv, qp.add(q_off), d);
             }
         }
+    }
+}
+
+// ------------------------------------------------------- multithreaded (12a)
+//
+// Each `_mt` kernel splits its output into disjoint ranges (rows of out / dx /
+// dw, or (batch, head) pairs for attention) and runs the single-threaded inner
+// fns on them, so per-element arithmetic, and therefore every result bit, is
+// the same as the single-threaded kernel. About 4 tasks per pool thread for
+// load balance; matmul row chunks are a multiple of MR so only the last chunk
+// has a row tail.
+
+/// Raw output pointer shared by tasks that write disjoint ranges of it.
+#[derive(Clone, Copy)]
+struct SyncPtr(*mut f32);
+// SAFETY: a SyncPtr is only created from a `&mut [f32]` that the creating
+// `_mt` fn holds exclusively for the whole `pool.run` call, and every task
+// only touches a range of it that no other task touches (each use site states
+// why its ranges are disjoint). So concurrent access never aliases.
+unsafe impl Send for SyncPtr {}
+// SAFETY: as above.
+unsafe impl Sync for SyncPtr {}
+
+impl SyncPtr {
+    fn get(self) -> *mut f32 {
+        self.0
+    }
+
+    /// `&mut buf[off..off + len]` of the buffer this pointer came from.
+    ///
+    /// # Safety
+    /// off + len <= that buffer's length, the buffer outlives `'a`, and no
+    /// other reference or task accesses that range during `'a`.
+    unsafe fn slice<'a>(self, off: usize, len: usize) -> &'a mut [f32] {
+        // SAFETY: caller contract.
+        unsafe { std::slice::from_raw_parts_mut(self.0.add(off), len) }
+    }
+}
+
+/// (chunk, n_tasks) splitting `total` items into ~4 tasks per pool thread,
+/// with chunk a multiple of `align`.
+fn split(total: usize, align: usize, pool: &ThreadPool) -> (usize, usize) {
+    if total == 0 {
+        return (align, 0);
+    }
+    let chunk = total.div_ceil(4 * pool.n_threads()).next_multiple_of(align);
+    (chunk, total.div_ceil(chunk))
+}
+
+/// Multithreaded `matmul_fwd`: W is packed once on the calling thread (its
+/// thread-local buffer) and shared read-only; tasks own row ranges of out.
+pub fn matmul_fwd_mt(
+    pool: &ThreadPool,
+    out: &mut [f32],
+    x: &[f32],
+    w: &[f32],
+    n: usize,
+    k: usize,
+    m: usize,
+) {
+    require_avx512();
+    assert_eq!(out.len(), n * m);
+    assert_eq!(x.len(), n * k);
+    assert_eq!(w.len(), m * k);
+    let need = packed_len(k, m);
+    PACK.with(|buf| {
+        let mut buf = buf.borrow_mut();
+        if buf.len() < need {
+            buf.resize(need, 0.0);
+        }
+        pack_wt(&mut buf[..need], w, k, m);
+        let packed: &[f32] = &buf[..need];
+        let (chunk, n_tasks) = split(n, MR, pool);
+        let op = SyncPtr(out.as_mut_ptr());
+        pool.run(n_tasks, &|i| {
+            let r0 = i * chunk;
+            let rows = chunk.min(n - r0);
+            // SAFETY: task i owns out rows r0..r0+rows; rows ranges of distinct
+            // i are disjoint and (r0 + rows) * m <= n * m = out.len(); out is
+            // exclusively borrowed by this fn until run returns.
+            let o = unsafe { op.slice(r0 * m, rows * m) };
+            matmul_fwd_rows(o, &x[r0 * k..][..rows * k], packed, rows, k, m);
+        });
+    });
+}
+
+/// Multithreaded `matmul_bwd` (accumulates): one run whose first tasks own
+/// row ranges of dx and whose remaining tasks own row ranges of dw. dx and dw
+/// are distinct buffers, so there are no races and no reductions.
+#[allow(clippy::too_many_arguments)]
+pub fn matmul_bwd_mt(
+    pool: &ThreadPool,
+    dx: &mut [f32],
+    dw: &mut [f32],
+    dout: &[f32],
+    x: &[f32],
+    w: &[f32],
+    n: usize,
+    k: usize,
+    m: usize,
+) {
+    require_avx512();
+    assert_eq!(dx.len(), n * k);
+    assert_eq!(dw.len(), m * k);
+    assert_eq!(dout.len(), n * m);
+    assert_eq!(x.len(), n * k);
+    assert_eq!(w.len(), m * k);
+    let (cx, tx) = split(n, MR, pool);
+    let (cw, tw) = split(m, MR, pool);
+    let dxp = SyncPtr(dx.as_mut_ptr());
+    let dwp = SyncPtr(dw.as_mut_ptr());
+    pool.run(tx + tw, &|i| {
+        if i < tx {
+            let r0 = i * cx;
+            let rows = cx.min(n - r0);
+            // SAFETY: dx tasks own disjoint row ranges r0..r0+rows of dx,
+            // (r0 + rows) * k <= dx.len(); dx is exclusively borrowed by this
+            // fn and is distinct from dw.
+            let d = unsafe { dxp.slice(r0 * k, rows * k) };
+            matmul_bwd_dx_rows(d, &dout[r0 * m..][..rows * m], w, rows, k, m);
+        } else {
+            let j0 = (i - tx) * cw;
+            let rows = cw.min(m - j0);
+            // SAFETY: dw tasks own disjoint row ranges j0..j0+rows of dw,
+            // (j0 + rows) * k <= dw.len(); dw is exclusively borrowed by this
+            // fn and is distinct from dx.
+            let d = unsafe { dwp.slice(j0 * k, rows * k) };
+            matmul_bwd_dw_rows(d, j0, rows, dout, x, n, k, m);
+        }
+    });
+}
+
+/// Multithreaded `attn_fwd`: tasks own ranges of (batch, head) pairs.
+#[allow(clippy::too_many_arguments)]
+pub fn attn_fwd_mt(
+    pool: &ThreadPool,
+    out: &mut [f32],
+    att: &mut [f32],
+    qkv: &[f32],
+    b: usize,
+    t: usize,
+    c: usize,
+    h: usize,
+) {
+    let d = attn_check(qkv, att, out.len(), b, t, c, h);
+    let (chunk, n_tasks) = split(b * h, 1, pool);
+    let op = SyncPtr(out.as_mut_ptr());
+    let ap = SyncPtr(att.as_mut_ptr());
+    pool.run(n_tasks, &|i| {
+        for bh in i * chunk..((i + 1) * chunk).min(b * h) {
+            // SAFETY: each (bi, hi) pair belongs to exactly one task. Its att
+            // block bh*t*t..+t*t (< b*h*t*t = att.len()) and its out region
+            // (rows of batch bi, cols hi*d..+d) are touched by no other pair;
+            // out and att are exclusively borrowed by this fn and distinct
+            // from each other and from qkv; shapes checked by attn_check.
+            unsafe {
+                let att_bh = ap.slice(bh * t * t, t * t);
+                attn_fwd_head(op.get(), att_bh, qkv, bh / h, bh % h, t, c, d);
+            }
+        }
+    });
+}
+
+/// Multithreaded `attn_bwd` (accumulates into dqkv): tasks own ranges of
+/// (batch, head) pairs; dp/ds scratch is each executing thread's `DS`.
+#[allow(clippy::too_many_arguments)]
+pub fn attn_bwd_mt(
+    pool: &ThreadPool,
+    dqkv: &mut [f32],
+    dout: &[f32],
+    qkv: &[f32],
+    att: &[f32],
+    b: usize,
+    t: usize,
+    c: usize,
+    h: usize,
+) {
+    let d = attn_check(qkv, att, dout.len(), b, t, c, h);
+    assert_eq!(dqkv.len(), qkv.len());
+    let (chunk, n_tasks) = split(b * h, 1, pool);
+    let gp = SyncPtr(dqkv.as_mut_ptr());
+    pool.run(n_tasks, &|i| {
+        DS.with(|buf| {
+            let mut buf = buf.borrow_mut();
+            if buf.len() < t {
+                buf.resize(t, 0.0);
+            }
+            for bh in i * chunk..((i + 1) * chunk).min(b * h) {
+                // SAFETY: each (bi, hi) pair belongs to exactly one task, and
+                // its dqkv region (rows of batch bi; q, k, v cols of head hi)
+                // is touched by no other pair; dqkv is exclusively borrowed by
+                // this fn and distinct from dout, qkv, att and the thread's
+                // own DS buffer; shapes checked above.
+                unsafe {
+                    attn_bwd_head(
+                        gp.get(),
+                        &mut buf[..t],
+                        dout,
+                        qkv,
+                        att,
+                        bh / h,
+                        bh % h,
+                        t,
+                        c,
+                        h,
+                        d,
+                    )
+                };
+            }
+        });
     });
 }
 
@@ -756,5 +1034,98 @@ mod tests {
             attn_bwd(&mut db, &dout, &qkv, &aa, b, t, c, h);
             assert_close(&db, &da, t, &format!("dqkv {what}"));
         }
+    }
+
+    fn bits(v: &[f32]) -> Vec<u32> {
+        v.iter().map(|x| x.to_bits()).collect()
+    }
+
+    const MT_POOLS: [usize; 3] = [1, 3, 4];
+
+    /// `_mt` matmuls are bit-identical to the single-threaded kernels.
+    #[test]
+    fn mt_matches_single_matmul() {
+        if !have_avx512() {
+            return;
+        }
+        let mut rng = Rng::new(21);
+        for &size in &MT_POOLS {
+            let pool = ThreadPool::new(size);
+            for &(n, k, m) in &MM_SHAPES {
+                let what = format!("pool {size} {n}x{k}x{m}");
+                let x = randn(&mut rng, n * k);
+                let w = randn(&mut rng, m * k);
+                let dout = randn(&mut rng, n * m);
+
+                let mut a = vec![5.0; n * m];
+                let mut b = vec![-3.0; n * m];
+                matmul_fwd(&mut a, &x, &w, n, k, m);
+                matmul_fwd_mt(&pool, &mut b, &x, &w, n, k, m);
+                assert_eq!(bits(&b), bits(&a), "fwd {what}");
+
+                let dx0 = randn(&mut rng, n * k);
+                let dw0 = randn(&mut rng, m * k);
+                let (mut dxa, mut dwa) = (dx0.clone(), dw0.clone());
+                let (mut dxb, mut dwb) = (dx0, dw0);
+                matmul_bwd(&mut dxa, &mut dwa, &dout, &x, &w, n, k, m);
+                matmul_bwd_mt(&pool, &mut dxb, &mut dwb, &dout, &x, &w, n, k, m);
+                assert_eq!(bits(&dxb), bits(&dxa), "dx {what}");
+                assert_eq!(bits(&dwb), bits(&dwa), "dw {what}");
+            }
+        }
+    }
+
+    /// `_mt` attention is bit-identical to the single-threaded kernels.
+    #[test]
+    fn mt_matches_single_attn() {
+        if !have_avx512() {
+            return;
+        }
+        let mut rng = Rng::new(22);
+        for &size in &MT_POOLS {
+            let pool = ThreadPool::new(size);
+            for &(b, t, c, h) in &ATTN_SHAPES {
+                let what = format!("pool {size} b{b} t{t} c{c} h{h}");
+                let qkv = randn(&mut rng, b * t * 3 * c);
+                let dout = randn(&mut rng, b * t * c);
+
+                let (mut oa, mut aa) = (vec![5.0; b * t * c], vec![5.0; b * h * t * t]);
+                let (mut ob, mut ab) = (vec![-3.0; b * t * c], vec![-3.0; b * h * t * t]);
+                attn_fwd(&mut oa, &mut aa, &qkv, b, t, c, h);
+                attn_fwd_mt(&pool, &mut ob, &mut ab, &qkv, b, t, c, h);
+                assert_eq!(bits(&ob), bits(&oa), "out {what}");
+                assert_eq!(bits(&ab), bits(&aa), "att {what}");
+
+                let d0 = randn(&mut rng, qkv.len());
+                let (mut da, mut db) = (d0.clone(), d0);
+                attn_bwd(&mut da, &dout, &qkv, &aa, b, t, c, h);
+                attn_bwd_mt(&pool, &mut db, &dout, &qkv, &aa, b, t, c, h);
+                assert_eq!(bits(&db), bits(&da), "dqkv {what}");
+            }
+        }
+    }
+
+    /// Batch of 8 x 4 heads (the training shape) splits into several tasks.
+    #[test]
+    fn mt_attn_many_heads() {
+        if !have_avx512() {
+            return;
+        }
+        let (b, t, c, h) = (8, 33, 64, 4);
+        let mut rng = Rng::new(23);
+        let pool = ThreadPool::new(4);
+        let qkv = randn(&mut rng, b * t * 3 * c);
+        let dout = randn(&mut rng, b * t * c);
+        let (mut oa, mut aa) = (vec![0.0; b * t * c], vec![0.0; b * h * t * t]);
+        let (mut ob, mut ab) = (vec![1.0; b * t * c], vec![1.0; b * h * t * t]);
+        attn_fwd(&mut oa, &mut aa, &qkv, b, t, c, h);
+        attn_fwd_mt(&pool, &mut ob, &mut ab, &qkv, b, t, c, h);
+        assert_eq!(bits(&ob), bits(&oa));
+        assert_eq!(bits(&ab), bits(&aa));
+        let d0 = randn(&mut rng, qkv.len());
+        let (mut da, mut db) = (d0.clone(), d0);
+        attn_bwd(&mut da, &dout, &qkv, &aa, b, t, c, h);
+        attn_bwd_mt(&pool, &mut db, &dout, &qkv, &aa, b, t, c, h);
+        assert_eq!(bits(&db), bits(&da));
     }
 }
