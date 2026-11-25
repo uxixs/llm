@@ -5,6 +5,7 @@ pub mod data;
 pub mod infer;
 pub mod model;
 pub mod optim;
+pub mod pool;
 pub mod rng;
 
 pub mod ops;
