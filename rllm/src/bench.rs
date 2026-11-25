@@ -187,7 +187,7 @@ pub fn train_step_tok_per_s_with(
         g.zero();
         black_box(forward(&p, cfg, be, &mut acts, &batch));
         backward(&p, cfg, be, &mut acts, &batch, &mut g);
-        opt.step(&mut p, &g, 1.0);
+        opt.step(&mut p, &g, 1.0, be);
     });
     (b * t) as f64 / secs
 }
@@ -229,7 +229,9 @@ fn timed(slot: &mut f64, f: impl FnOnce()) {
 /// gather, residual adds and the zero-fills are not timed; MTP heads are not run)
 /// and calls the same dispatchers and scalar ops with the model's shapes, so it must
 /// be kept in step with model.rs. Intermediate buffers are random, not chained: only
-/// the timing is meaningful. Rows: the 8 op types plus `rope`, `optimizer`, `sum`.
+/// the timing is meaningful. Rows: the op types (`softcap+xent` is the fused
+/// `backend::softcap_xent`, `rope` the table versions) plus `optimizer` (NS5 on
+/// `be`) and `sum`.
 pub fn profile_step_with(
     be: Backend,
     cfg: &Config,
@@ -251,13 +253,13 @@ pub fn profile_step_with(
     let up = randn(&mut rng, n * 4 * d);
     let (mut act, mut up_buf) = (vec![0.0f32; n * 4 * d], vec![0.0f32; n * 4 * d]);
     let mut rope_buf = randn(&mut rng, n * d);
+    let rope_tab = scalar::RopeTable::new(t, d / h);
     let (mut raw, mut capped) = (vec![0.0f32; n * v], vec![0.0f32; n * v]);
     let mut dlogits = vec![0.0f32; n * v];
     let tgt: Vec<u16> = (0..n).map(|_| rng.below(v) as u16).collect();
     let mask = vec![1.0f32; n];
     let (mut dx, mut dln, mut dqkv) = (vec![0.0; n * d], vec![0.0; n * d], vec![0.0; n * 3 * d]);
     let (mut dup, mut dact) = (vec![0.0; n * 4 * d], vec![0.0; n * 4 * d]);
-    let mut sv = vec![0.0f32; n * v];
     let mut qkv_work = qkv.clone();
     let mut dg = vec![0.0f32; d];
     let mut rs = rstd.clone();
@@ -274,8 +276,8 @@ pub fn profile_step_with(
                 backend::matmul_fwd(be, &mut qkv_work, &ln, &lp.wqkv.data, n, d, 3 * d)
             });
             timed(&mut tl[ROPE], || {
-                scalar::rope_fwd(&mut rope_buf, b, t, h, d / h);
-                scalar::rope_fwd(&mut rope_buf, b, t, h, d / h);
+                scalar::rope_fwd_table(&mut rope_buf, b, t, h, d / h, &rope_tab);
+                scalar::rope_fwd_table(&mut rope_buf, b, t, h, d / h, &rope_tab);
             });
             timed(&mut tl[AT_F], || backend::attn_fwd(be, &mut ao, &mut att, &qkv, b, t, d, h));
             timed(&mut tl[MM_F], || backend::matmul_fwd(be, &mut sd, &ao, &lp.wo.data, n, d, d));
@@ -290,19 +292,15 @@ pub fn profile_step_with(
         }
         timed(&mut tl[RMS], || scalar::rmsnorm_fwd(&mut ln, &mut rs, &x, &p.final_norm, n, d));
         timed(&mut tl[MM_F], || backend::matmul_fwd(be, &mut raw, &ln, &p.wte.data, n, d, v));
+        // Fused softcap -> xent -> softcap backward (dlogits = d loss / d pre-cap logits).
         timed(&mut tl[CAP], || {
-            scalar::softcap_fwd(&mut capped, &raw, cfg.softcap);
-            scalar::xent_fwd_bwd(&mut dlogits, &capped, &tgt, &mask, n, v);
+            backend::softcap_xent(be, &mut dlogits, &raw, &mut capped, &tgt, &mask, n, v, cfg.softcap);
         });
 
         // Backward.
-        sv.fill(0.0);
-        timed(&mut tl[CAP], || {
-            scalar::softcap_bwd(&mut sv, &dlogits, &capped, cfg.softcap);
-        });
         dln.fill(0.0);
         timed(&mut tl[MM_B], || {
-            backend::matmul_bwd(be, &mut dln, &mut g.wte.data, &sv, &ln, &p.wte.data, n, d, v)
+            backend::matmul_bwd(be, &mut dln, &mut g.wte.data, &dlogits, &ln, &p.wte.data, n, d, v)
         });
         dx.fill(0.0);
         timed(&mut tl[RMS], || {
@@ -329,8 +327,8 @@ pub fn profile_step_with(
             dqkv.fill(0.0);
             timed(&mut tl[AT_B], || backend::attn_bwd(be, &mut dqkv, &sd, &qkv, &att, b, t, d, h));
             timed(&mut tl[ROPE], || {
-                scalar::rope_bwd(&mut rope_buf, b, t, h, d / h);
-                scalar::rope_bwd(&mut rope_buf, b, t, h, d / h);
+                scalar::rope_bwd_table(&mut rope_buf, b, t, h, d / h, &rope_tab);
+                scalar::rope_bwd_table(&mut rope_buf, b, t, h, d / h, &rope_tab);
             });
             dln.fill(0.0);
             timed(&mut tl[MM_B], || {
@@ -340,7 +338,7 @@ pub fn profile_step_with(
                 scalar::rmsnorm_bwd(&mut dx, &mut lg.attn_norm, &dln, &x, &lp.attn_norm, &rstd, n, d)
             });
         }
-        timed(&mut tl[OPT], || opt.step(&mut p, &g, 1.0));
+        timed(&mut tl[OPT], || opt.step(&mut p, &g, 1.0, be));
         tm
     };
 

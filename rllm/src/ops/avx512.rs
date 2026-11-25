@@ -876,6 +876,295 @@ pub fn attn_bwd_mt(
     });
 }
 
+// ------------------------------------------------- softcap + cross-entropy
+//
+// `softcap_xent_fwd_bwd` fuses the model's head chain `softcap_fwd` ->
+// `xent_fwd_bwd` -> `softcap_bwd` (into zeros) per row, in three passes over
+// the row: (1) y = cap*tanh(x/cap) into dpre and the row max; (2) e =
+// exp(y - max) into a thread-local row buffer and the row sum; (3) dpre =
+// (e/sum - onehot) * scale * (1 - (y/cap)^2). exp is `exp_ps` (relative error
+// <= 2e-7 on [-87, 0], see its test); tanh is built on the matching expm1 so it
+// stays accurate near 0. Results are close to the scalar chain, not bit-equal
+// (lane-order sums, own exp/tanh).
+
+/// ln 2 split for Cody-Waite reduction: HI has few mantissa bits so n*HI is exact.
+const LN2_HI: f32 = 0.693_359_4;
+const LN2_LO: f32 = -2.121_944_4e-4;
+/// ln(2^-126): below it e^x would be subnormal; `exp_ps` returns 0 there.
+const EXP_MIN: f32 = -87.336_54;
+const EXP_MAX: f32 = 88.0;
+
+/// Range reduction x = n*ln2 + r (|r| <= ln2/2) and q = e^r - 1 by a degree-7
+/// Taylor polynomial (truncation < 6e-9 relative). Returns (2^n, q). Inputs
+/// are clamped to [EXP_MIN, EXP_MAX].
+///
+/// # Safety
+/// avx512f is available.
+#[inline]
+#[target_feature(enable = "avx512f")]
+unsafe fn exp_parts(x: __m512) -> (__m512, __m512) {
+    let x = _mm512_min_ps(_mm512_max_ps(x, _mm512_set1_ps(EXP_MIN)), _mm512_set1_ps(EXP_MAX));
+    let n = _mm512_roundscale_ps::<{ _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC }>(
+        _mm512_mul_ps(x, _mm512_set1_ps(std::f32::consts::LOG2_E)),
+    );
+    let r = _mm512_fnmadd_ps(n, _mm512_set1_ps(LN2_HI), x);
+    let r = _mm512_fnmadd_ps(n, _mm512_set1_ps(LN2_LO), r);
+    let mut p = _mm512_set1_ps(1.0 / 5040.0);
+    for c in [1.0 / 720.0, 1.0 / 120.0, 1.0 / 24.0, 1.0 / 6.0, 0.5, 1.0] {
+        p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(c));
+    }
+    let q = _mm512_mul_ps(p, r);
+    (_mm512_scalef_ps(_mm512_set1_ps(1.0), n), q)
+}
+
+/// e^x per lane as 2^n * (1 + q) with one final rounding. Max relative error
+/// <= 2e-7 on [-87, 0] (tested); lanes below EXP_MIN return 0.
+///
+/// # Safety
+/// avx512f is available.
+#[inline]
+#[target_feature(enable = "avx512f")]
+unsafe fn exp_ps(x: __m512) -> __m512 {
+    // SAFETY: avx512f is available (caller contract).
+    let (s, q) = unsafe { exp_parts(x) };
+    let under = _mm512_cmp_ps_mask::<_CMP_LT_OQ>(x, _mm512_set1_ps(EXP_MIN));
+    _mm512_maskz_mov_ps(!under, _mm512_fmadd_ps(s, q, s))
+}
+
+/// cap * tanh(x / cap) per lane, via tanh(a) = -m / (2 + m) with
+/// m = expm1(-2|a|) = 2^n*q + (2^n - 1); 2^n - 1 is exact for the n that
+/// matter, so this stays accurate near 0. The sign of x/cap is restored last.
+///
+/// # Safety
+/// avx512f is available.
+#[inline]
+#[target_feature(enable = "avx512f")]
+unsafe fn softcap_ps(x: __m512, cap: __m512) -> __m512 {
+    let z = _mm512_div_ps(x, cap);
+    let sign_bit = _mm512_set1_epi32(i32::MIN);
+    let zi = _mm512_castps_si512(z);
+    let sign = _mm512_and_si512(zi, sign_bit);
+    let a = _mm512_castsi512_ps(_mm512_andnot_si512(sign_bit, zi));
+    // SAFETY: avx512f is available (caller contract).
+    let (s, q) = unsafe { exp_parts(_mm512_mul_ps(a, _mm512_set1_ps(-2.0))) };
+    let m = _mm512_fmadd_ps(s, q, _mm512_sub_ps(s, _mm512_set1_ps(1.0)));
+    let t = _mm512_div_ps(
+        _mm512_sub_ps(_mm512_setzero_ps(), m),
+        _mm512_add_ps(_mm512_set1_ps(2.0), m),
+    );
+    let t = _mm512_castsi512_ps(_mm512_or_si512(_mm512_castps_si512(t), sign));
+    _mm512_mul_ps(cap, t)
+}
+
+thread_local! {
+    /// One row of exp(y - max) for `softcap_xent_row` (per executing thread).
+    static XE: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+    /// Per-row loss terms of `softcap_xent_fwd_bwd_mt` (calling thread).
+    static XLOSS: RefCell<Vec<f64>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Checks features and shapes; returns sum(mask) (the same f32 sum as
+/// `scalar::xent_fwd_bwd`).
+fn softcap_xent_check(
+    dpre: &[f32],
+    pre: &[f32],
+    targets: &[u16],
+    mask: &[f32],
+    n: usize,
+    v: usize,
+) -> f32 {
+    require_avx512();
+    assert_eq!(dpre.len(), n * v);
+    assert_eq!(pre.len(), n * v);
+    assert_eq!(targets.len(), n);
+    assert_eq!(mask.len(), n);
+    mask.iter().sum()
+}
+
+/// One row of the fused op: overwrites `drow` (len v) with d loss / d pre-cap
+/// logits (already scaled by m/msum) and returns the row's loss term
+/// `m * (ln sum + max - y_t)` in f64 (0 for a masked-out row). Uses the
+/// executing thread's `XE` buffer. Callers have asserted avx512f.
+fn softcap_xent_row(drow: &mut [f32], prow: &[f32], t: usize, m: f32, msum: f32, cap: f32) -> f64 {
+    let v = prow.len();
+    assert_eq!(drow.len(), v);
+    assert!(t < v, "target {t} out of range for vocab {v}");
+    if m == 0.0 {
+        drow.fill(0.0);
+        return 0.0;
+    }
+    let scale = m / msum;
+    XE.with(|buf| {
+        let mut buf = buf.borrow_mut();
+        if buf.len() < v {
+            buf.resize(v, 0.0);
+        }
+        // SAFETY: avx512f was asserted by the public entry points
+        // (`softcap_xent_check`); drow, prow and the XE slice all have length
+        // v > t (checked above) and are distinct buffers.
+        let (sum, max, y_t) = unsafe { softcap_xent_row_simd(drow, prow, &mut buf[..v], t, scale, cap) };
+        m as f64 * ((sum.ln() + max - y_t) as f64)
+    })
+}
+
+/// SIMD body of `softcap_xent_row`; returns (sum, max, y_t).
+///
+/// # Safety
+/// avx512f is available; drow, prow and e have the same length v > t and do
+/// not overlap.
+#[target_feature(enable = "avx512f")]
+unsafe fn softcap_xent_row_simd(
+    drow: &mut [f32],
+    prow: &[f32],
+    e: &mut [f32],
+    t: usize,
+    scale: f32,
+    cap: f32,
+) -> (f32, f32, f32) {
+    let v = prow.len();
+    let (dp, pp, ep) = (drow.as_mut_ptr(), prow.as_ptr(), e.as_mut_ptr());
+    let capv = _mm512_set1_ps(cap);
+    // Pass 1: y into drow; running max (masked-off lanes keep the old max).
+    let mut vmax = _mm512_set1_ps(f32::NEG_INFINITY);
+    let mut j = 0;
+    while j < v {
+        let mk = tail_mask(v - j);
+        // SAFETY: lanes j..min(j+16, v) are in bounds of prow and drow; the
+        // rest are masked off.
+        unsafe {
+            let y = softcap_ps(_mm512_maskz_loadu_ps(mk, pp.add(j)), capv);
+            _mm512_mask_storeu_ps(dp.add(j), mk, y);
+            vmax = _mm512_mask_max_ps(vmax, mk, vmax, y);
+        }
+        j += L;
+    }
+    let max = _mm512_reduce_max_ps(vmax);
+    // Pass 2: e = exp(y - max) into e; masked sum.
+    let (maxv, mut vsum) = (_mm512_set1_ps(max), _mm512_setzero_ps());
+    let mut j = 0;
+    while j < v {
+        let mk = tail_mask(v - j);
+        // SAFETY: lanes j..min(j+16, v) are in bounds of drow and e; the rest
+        // are masked off.
+        unsafe {
+            let ex = exp_ps(_mm512_sub_ps(_mm512_maskz_loadu_ps(mk, dp.add(j)), maxv));
+            _mm512_mask_storeu_ps(ep.add(j), mk, ex);
+            vsum = _mm512_mask_add_ps(vsum, mk, vsum, ex);
+        }
+        j += L;
+    }
+    let sum = _mm512_reduce_add_ps(vsum);
+    let y_t = drow[t];
+    // Pass 3: dpre = e * (scale/sum) * (1 - (y/cap)^2); the target is fixed below.
+    let inv = scale / sum;
+    let (invv, one) = (_mm512_set1_ps(inv), _mm512_set1_ps(1.0));
+    let mut j = 0;
+    while j < v {
+        let mk = tail_mask(v - j);
+        // SAFETY: lanes j..min(j+16, v) are in bounds of drow and e; the rest
+        // are masked off.
+        unsafe {
+            let tt = _mm512_div_ps(_mm512_maskz_loadu_ps(mk, dp.add(j)), capv);
+            let fac = _mm512_fnmadd_ps(tt, tt, one);
+            let ex = _mm512_maskz_loadu_ps(mk, ep.add(j));
+            _mm512_mask_storeu_ps(dp.add(j), mk, _mm512_mul_ps(_mm512_mul_ps(ex, invv), fac));
+        }
+        j += L;
+    }
+    let tt = y_t / cap;
+    drow[t] = (e[t] * inv - scale) * (1.0 - tt * tt);
+    (sum, max, y_t)
+}
+
+/// Fused `scalar::softcap_fwd` -> `scalar::xent_fwd_bwd` -> `scalar::softcap_bwd`
+/// (into zeros): `pre` is `[n, v]` pre-cap logits; returns the masked mean xent
+/// of the capped logits and OVERWRITES `dpre` with its gradient w.r.t. `pre`.
+/// sum(mask) == 0 gives loss 0 and dpre 0. Close to, not bit-equal to, the chain.
+pub fn softcap_xent_fwd_bwd(
+    dpre: &mut [f32],
+    pre: &[f32],
+    targets: &[u16],
+    mask: &[f32],
+    n: usize,
+    v: usize,
+    cap: f32,
+) -> f32 {
+    let msum = softcap_xent_check(dpre, pre, targets, mask, n, v);
+    if msum == 0.0 {
+        dpre.fill(0.0);
+        return 0.0;
+    }
+    let mut loss = 0.0f64;
+    for i in 0..n {
+        let r = i * v..(i + 1) * v;
+        let (t, m) = (targets[i] as usize, mask[i]);
+        loss += softcap_xent_row(&mut dpre[r.clone()], &pre[r], t, m, msum, cap);
+    }
+    (loss / msum as f64) as f32
+}
+
+/// Raw pointer to the per-row loss buffer, shared by tasks writing disjoint slots.
+#[derive(Clone, Copy)]
+struct SyncPtrF64(*mut f64);
+// SAFETY: created only from the calling thread's XLOSS buffer, which
+// `softcap_xent_fwd_bwd_mt` borrows mutably for the whole `pool.run`; each
+// task writes only the slots of its own rows, so accesses never alias.
+unsafe impl Send for SyncPtrF64 {}
+// SAFETY: as above.
+unsafe impl Sync for SyncPtrF64 {}
+
+impl SyncPtrF64 {
+    /// Method (not field) access, so closures capture the whole Sync wrapper.
+    fn get(self) -> *mut f64 {
+        self.0
+    }
+}
+
+/// Multithreaded `softcap_xent_fwd_bwd`, bit-identical to it: tasks own row
+/// ranges of dpre and store each row's loss term; the terms are then summed in
+/// row order on the calling thread, exactly as the single-threaded loop does.
+#[allow(clippy::too_many_arguments)]
+pub fn softcap_xent_fwd_bwd_mt(
+    pool: &ThreadPool,
+    dpre: &mut [f32],
+    pre: &[f32],
+    targets: &[u16],
+    mask: &[f32],
+    n: usize,
+    v: usize,
+    cap: f32,
+) -> f32 {
+    let msum = softcap_xent_check(dpre, pre, targets, mask, n, v);
+    if msum == 0.0 {
+        dpre.fill(0.0);
+        return 0.0;
+    }
+    XLOSS.with(|lb| {
+        let mut lb = lb.borrow_mut();
+        if lb.len() < n {
+            lb.resize(n, 0.0);
+        }
+        let (chunk, n_tasks) = split(n, 1, pool);
+        let (dp, lp) = (SyncPtr(dpre.as_mut_ptr()), SyncPtrF64(lb.as_mut_ptr()));
+        pool.run(n_tasks, &|ti| {
+            for i in ti * chunk..((ti + 1) * chunk).min(n) {
+                // SAFETY: row i belongs to exactly one task; its dpre range
+                // i*v..(i+1)*v (within n*v = dpre.len()) is touched by no other
+                // task, and dpre is exclusively borrowed by this fn until run
+                // returns.
+                let drow = unsafe { dp.slice(i * v, v) };
+                let r = i * v..(i + 1) * v;
+                let term = softcap_xent_row(drow, &pre[r], targets[i] as usize, mask[i], msum, cap);
+                // SAFETY: i < n <= lb.len(), and slot i is written only by the
+                // task that owns row i; lb is not otherwise accessed during run.
+                unsafe { *lp.get().add(i) = term };
+            }
+        });
+        let loss = lb[..n].iter().fold(0.0f64, |acc, &x| acc + x);
+        (loss / msum as f64) as f32
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1127,5 +1416,117 @@ mod tests {
         attn_bwd(&mut da, &dout, &qkv, &aa, b, t, c, h);
         attn_bwd_mt(&pool, &mut db, &dout, &qkv, &aa, b, t, c, h);
         assert_eq!(bits(&db), bits(&da));
+    }
+
+    /// Max relative error of `exp_ps` against f64 exp over [-87, 0].
+    #[test]
+    fn vec_exp_max_rel_error() {
+        if !have_avx512() {
+            return;
+        }
+        const N: usize = 1 << 22;
+        let mut xs: Vec<f32> = (0..N).map(|i| -87.0 * i as f32 / (N - 1) as f32).collect();
+        let ln2 = std::f32::consts::LN_2;
+        xs.extend([0.0, -0.0, -1e-30, -1e-7, -0.34657, -0.34658, -ln2, -86.99999, -87.0]);
+        let mut worst = (0.0f64, 0.0f32);
+        for ch in xs.chunks(L) {
+            let mk = tail_mask(ch.len());
+            let mut out = [0.0f32; L];
+            // SAFETY: avx512f checked; lanes < ch.len() are in bounds, rest masked.
+            unsafe {
+                let e = exp_ps(_mm512_maskz_loadu_ps(mk, ch.as_ptr()));
+                _mm512_mask_storeu_ps(out.as_mut_ptr(), mk, e);
+            }
+            for (&x, &e) in ch.iter().zip(&out) {
+                let r = (x as f64).exp();
+                let rel = ((e as f64) - r).abs() / r;
+                if rel > worst.0 {
+                    worst = (rel, x);
+                }
+            }
+        }
+        println!("exp_ps max rel error {:.3e} at x = {}", worst.0, worst.1);
+        assert!(worst.0 <= 2e-7, "exp_ps max rel error {} at x = {}", worst.0, worst.1);
+    }
+
+    /// The model's old chain: softcap_fwd -> xent_fwd_bwd -> softcap_bwd into zeros.
+    fn softcap_xent_chain(
+        pre: &[f32],
+        tgt: &[u16],
+        mask: &[f32],
+        n: usize,
+        v: usize,
+        cap: f32,
+    ) -> (f32, Vec<f32>) {
+        let mut capped = vec![0.0; n * v];
+        scalar::softcap_fwd(&mut capped, pre, cap);
+        let mut dcap = vec![0.0; n * v];
+        let loss = scalar::xent_fwd_bwd(&mut dcap, &capped, tgt, mask, n, v);
+        let mut dpre = vec![0.0; n * v];
+        scalar::softcap_bwd(&mut dpre, &dcap, &capped, cap);
+        (loss, dpre)
+    }
+
+    /// (n, v, logit std, mask) cases; masks include zeros (and an all-zero mask).
+    fn xent_cases() -> Vec<(usize, usize, f32, Vec<f32>)> {
+        let m300: Vec<f32> = (0..300)
+            .map(|i| if i % 7 == 3 { 0.0 } else if i % 5 == 0 { 0.5 } else { 1.0 })
+            .collect();
+        vec![
+            (1, 7, 3.0, vec![1.0]),
+            (1, 7, 3.0, vec![0.0]),
+            (3, 2048, 10.0, vec![1.0, 0.0, 0.5]),
+            (3, 2048, 50.0, vec![1.0, 1.0, 1.0]),
+            (300, 2048, 5.0, m300.clone()),
+            (300, 2048, 40.0, m300),
+        ]
+    }
+
+    #[test]
+    fn softcap_xent_matches_scalar_chain() {
+        if !have_avx512() {
+            return;
+        }
+        let mut rng = Rng::new(31);
+        let cap = 30.0;
+        for (n, v, std, mask) in xent_cases() {
+            let what = format!("{n}x{v} std {std} mask0 {}", mask[0]);
+            let pre: Vec<f32> = randn(&mut rng, n * v).iter().map(|x| x * std).collect();
+            let tgt: Vec<u16> = (0..n).map(|_| rng.below(v) as u16).collect();
+            let (l0, d0) = softcap_xent_chain(&pre, &tgt, &mask, n, v, cap);
+            let mut d = vec![7.0; n * v];
+            let l = softcap_xent_fwd_bwd(&mut d, &pre, &tgt, &mask, n, v, cap);
+            assert!((l - l0).abs() <= 1e-5 * l0.abs(), "{what}: loss {l} vs {l0}");
+            let mx = max_abs(&d0);
+            let err = d.iter().zip(&d0).fold(0.0f32, |a, (x, y)| a.max((x - y).abs()));
+            let rel = if l0 == 0.0 { 0.0 } else { (l - l0).abs() / l0.abs() };
+            println!("{what}: loss rel err {rel:.2e}, dlogits err/max {:.2e}", err / mx.max(f32::MIN_POSITIVE));
+            assert!(err <= 1e-5 * mx, "{what}: dlogits err {err} vs max {mx}");
+            for (i, &m) in mask.iter().enumerate() {
+                if m == 0.0 {
+                    assert!(d[i * v..(i + 1) * v].iter().all(|&x| x == 0.0), "{what}: row {i}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn softcap_xent_mt_bit_exact() {
+        if !have_avx512() {
+            return;
+        }
+        let mut rng = Rng::new(32);
+        for &size in &MT_POOLS {
+            let pool = ThreadPool::new(size);
+            for (n, v, std, mask) in xent_cases() {
+                let pre: Vec<f32> = randn(&mut rng, n * v).iter().map(|x| x * std).collect();
+                let tgt: Vec<u16> = (0..n).map(|_| rng.below(v) as u16).collect();
+                let (mut da, mut db) = (vec![1.0; n * v], vec![-2.0; n * v]);
+                let la = softcap_xent_fwd_bwd(&mut da, &pre, &tgt, &mask, n, v, 30.0);
+                let lb = softcap_xent_fwd_bwd_mt(&pool, &mut db, &pre, &tgt, &mask, n, v, 30.0);
+                assert_eq!(lb.to_bits(), la.to_bits(), "pool {size} {n}x{v}: loss");
+                assert_eq!(bits(&db), bits(&da), "pool {size} {n}x{v}: dlogits");
+            }
+        }
     }
 }

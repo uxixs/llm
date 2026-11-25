@@ -26,6 +26,8 @@ pub struct KvCache {
     act: Vec<f32>,
     logits: Vec<f32>,
     raw: Vec<f32>,
+    /// RoPE angles for positions `0..ctx`, head dim `d / heads`.
+    rope: scalar::RopeTable,
 }
 
 impl KvCache {
@@ -45,6 +47,7 @@ impl KvCache {
             act: z(4 * d),
             logits: z(cfg.vocab),
             raw: z(cfg.vocab),
+            rope: scalar::RopeTable::new(cfg.ctx, d / cfg.heads),
         }
     }
 }
@@ -73,8 +76,8 @@ pub fn step(
     for (l, lp) in p.layers.iter().enumerate() {
         scalar::rmsnorm_fwd(&mut c.ln, &mut c.rstd, &c.x, &lp.attn_norm, 1, d);
         backend::matmul_fwd(be, &mut c.qkv, &c.ln, &lp.wqkv.data, 1, d, 3 * d);
-        scalar::rope_at(&mut c.qkv[..d], h, dh, pos);
-        scalar::rope_at(&mut c.qkv[d..2 * d], h, dh, pos);
+        scalar::rope_at_table(&mut c.qkv[..d], h, dh, pos, &c.rope);
+        scalar::rope_at_table(&mut c.qkv[d..2 * d], h, dh, pos, &c.rope);
         c.k[l][pos * d..(pos + 1) * d].copy_from_slice(&c.qkv[d..2 * d]);
         c.v[l][pos * d..(pos + 1) * d].copy_from_slice(&c.qkv[2 * d..]);
         for hh in 0..h {

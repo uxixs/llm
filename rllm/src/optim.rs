@@ -1,6 +1,8 @@
 //! Optimizers: AdamW (embedding + norm gains) and Muon (all weight matrices).
 //!
-//! All state and Newton-Schulz scratch is allocated in `new`; `step` never allocates.
+//! All state and Newton-Schulz scratch is allocated in `new`; `step` never allocates
+//! (beyond what the backend's matmul keeps in its own reusable scratch). Every NS5
+//! product runs on `backend::matmul_fwd(be, ..)`.
 
 use crate::backend::{matmul_fwd, Backend};
 use crate::model::{Mat, Params};
@@ -82,8 +84,9 @@ impl NsScratch {
         }
     }
 
-    /// Orthogonalizes `g` (rows x cols) into `self.out` (same orientation).
-    fn run(&mut self, g: &[f32]) {
+    /// Orthogonalizes `g` (rows x cols) into `self.out` (same orientation); all
+    /// products on backend `be`.
+    fn run(&mut self, g: &[f32], be: Backend) {
         let (rows, cols) = (self.rows, self.cols);
         assert_eq!(g.len(), rows * cols);
         let tall = rows > cols;
@@ -103,8 +106,8 @@ impl NsScratch {
         let (ca, cb, cc) = NS_COEF;
         for _ in 0..5 {
             // A = X Xᵀ (r x r); A² = A Aᵀ since A is symmetric.
-            matmul_fwd(Backend::Scalar, &mut self.a, &self.x, &self.x, r, c, r);
-            matmul_fwd(Backend::Scalar, &mut self.aa, &self.a, &self.a, r, r, r);
+            matmul_fwd(be, &mut self.a, &self.x, &self.x, r, c, r);
+            matmul_fwd(be, &mut self.aa, &self.a, &self.a, r, r, r);
             // B = b·A + c·A², kept in `aa` (symmetric).
             for (q, &p) in self.aa.iter_mut().zip(&self.a) {
                 *q = cb * p + cc * *q;
@@ -115,7 +118,7 @@ impl NsScratch {
                     self.xt[j * r + i] = self.x[i * c + j];
                 }
             }
-            matmul_fwd(Backend::Scalar, &mut self.bx, &self.aa, &self.xt, r, r, c);
+            matmul_fwd(be, &mut self.bx, &self.aa, &self.xt, r, r, c);
             for (x, &p) in self.x.iter_mut().zip(&self.bx) {
                 *x = ca * *x + p;
             }
@@ -132,11 +135,11 @@ impl NsScratch {
     }
 }
 
-/// Newton-Schulz quintic orthogonalization (5 iterations). Allocates; the optimizer
-/// uses preallocated scratch instead.
-pub fn newton_schulz5(g: &Mat) -> Mat {
+/// Newton-Schulz quintic orthogonalization (5 iterations) with products on `be`.
+/// Allocates; the optimizer uses preallocated scratch instead.
+pub fn newton_schulz5(g: &Mat, be: Backend) -> Mat {
     let mut s = NsScratch::new(g.rows, g.cols);
-    s.run(&g.data);
+    s.run(&g.data, be);
     Mat {
         rows: g.rows,
         cols: g.cols,
@@ -171,8 +174,8 @@ impl Muon {
         }
     }
 
-    /// One update of matrix `slot` with effective lr `lr * lr_mult`.
-    pub fn step(&mut self, slot: usize, w: &mut Mat, g: &Mat, lr_mult: f32) {
+    /// One update of matrix `slot` with effective lr `lr * lr_mult`; NS5 on `be`.
+    pub fn step(&mut self, slot: usize, w: &mut Mat, g: &Mat, lr_mult: f32, be: Backend) {
         assert_eq!((w.rows, w.cols), (g.rows, g.cols));
         let n = w.data.len();
         let (mu, buf, u) = (self.momentum, &mut self.buf[slot], &mut self.u[..n]);
@@ -186,7 +189,7 @@ impl Muon {
             .iter_mut()
             .find(|s| s.rows == w.rows && s.cols == w.cols)
             .expect("no scratch for shape");
-        s.run(u);
+        s.run(u, be);
         let scale = (w.rows as f32 / w.cols as f32).max(1.0).sqrt();
         let k = self.lr * lr_mult * scale;
         for (wv, &o) in w.data.iter_mut().zip(&s.out) {
@@ -219,8 +222,8 @@ impl Optimizer {
         }
     }
 
-    /// Muon: layer matrices + mtp mats. AdamW: `wte` + norm gains.
-    pub fn step(&mut self, p: &mut Params, g: &Params, lr_mult: f32) {
+    /// Muon: layer matrices + mtp mats (NS5 on `be`). AdamW: `wte` + norm gains.
+    pub fn step(&mut self, p: &mut Params, g: &Params, lr_mult: f32, be: Backend) {
         let (mut a, mut m) = (0, 0);
         self.adam.step(a, &mut p.wte.data, &g.wte.data, lr_mult);
         a += 1;
@@ -235,13 +238,13 @@ impl Optimizer {
                 (&mut pl.w_up, &gl.w_up),
                 (&mut pl.w_down, &gl.w_down),
             ] {
-                self.muon.step(m, pw, gw, lr_mult);
+                self.muon.step(m, pw, gw, lr_mult, be);
                 m += 1;
             }
         }
         self.adam.step(a, &mut p.final_norm, &g.final_norm, lr_mult);
         for (pw, gw) in p.mtp.iter_mut().zip(&g.mtp) {
-            self.muon.step(m, pw, gw, lr_mult);
+            self.muon.step(m, pw, gw, lr_mult, be);
             m += 1;
         }
     }
@@ -270,7 +273,7 @@ mod tests {
     fn ns5_near_orthogonal() {
         let mut rng = Rng::new(1);
         let g = randmat(&mut rng, 32, 16);
-        let x = newton_schulz5(&g);
+        let x = newton_schulz5(&g, Backend::Scalar);
         assert_eq!((x.rows, x.cols), (32, 16));
         // rows > cols: columns are the short side, so XᵀX (16x16) should be ~identity.
         let c = 16;
@@ -285,7 +288,7 @@ mod tests {
             }
         }
         // wide case too: X·Xᵀ (8x8) for an 8x24 input.
-        let w = newton_schulz5(&randmat(&mut rng, 8, 24));
+        let w = newton_schulz5(&randmat(&mut rng, 8, 24), Backend::Scalar);
         for i in 0..8 {
             for j in 0..8 {
                 let dot: f32 = (0..24)
@@ -296,6 +299,97 @@ mod tests {
                 } else {
                     assert!(dot.abs() < 0.3, "wide off ({i},{j}): {dot}");
                 }
+            }
+        }
+    }
+
+    /// The pre-backend NS5 (all products on `scalar::matmul_fwd`), kept as the reference.
+    fn ns5_reference(g: &Mat) -> Vec<f32> {
+        use crate::ops::scalar::matmul_fwd as mm;
+        let (rows, cols) = (g.rows, g.cols);
+        let tall = rows > cols;
+        let (r, c) = (rows.min(cols), rows.max(cols));
+        let inv = 1.0 / (g.data.iter().map(|v| v * v).sum::<f32>().sqrt() + NS_EPS);
+        let mut x = vec![0.0f32; r * c];
+        if tall {
+            for i in 0..rows {
+                for j in 0..cols {
+                    x[j * rows + i] = g.data[i * cols + j] * inv;
+                }
+            }
+        } else {
+            for (xv, &v) in x.iter_mut().zip(&g.data) {
+                *xv = v * inv;
+            }
+        }
+        let (mut a, mut aa) = (vec![0.0f32; r * r], vec![0.0f32; r * r]);
+        let (mut xt, mut bx) = (vec![0.0f32; r * c], vec![0.0f32; r * c]);
+        let (ca, cb, cc) = NS_COEF;
+        for _ in 0..5 {
+            mm(&mut a, &x, &x, r, c, r);
+            mm(&mut aa, &a, &a, r, r, r);
+            for (q, &p) in aa.iter_mut().zip(&a) {
+                *q = cb * p + cc * *q;
+            }
+            for i in 0..r {
+                for j in 0..c {
+                    xt[j * r + i] = x[i * c + j];
+                }
+            }
+            mm(&mut bx, &aa, &xt, r, r, c);
+            for (xv, &p) in x.iter_mut().zip(&bx) {
+                *xv = ca * *xv + p;
+            }
+        }
+        if tall {
+            let mut out = vec![0.0f32; rows * cols];
+            for i in 0..rows {
+                for j in 0..cols {
+                    out[i * cols + j] = x[j * rows + i];
+                }
+            }
+            out
+        } else {
+            x
+        }
+    }
+
+    const NS_SHAPES: [(usize, usize); 6] = [(1, 1), (7, 19), (19, 7), (32, 16), (128, 384), (384, 128)];
+
+    #[test]
+    fn ns5_scalar_backend_bit_exact_vs_reference() {
+        let mut rng = Rng::new(3);
+        for &(r, c) in &NS_SHAPES {
+            let g = randmat(&mut rng, r, c);
+            let want = ns5_reference(&g);
+            let got = newton_schulz5(&g, Backend::Scalar);
+            assert_eq!((got.rows, got.cols), (r, c));
+            assert!(
+                got.data.iter().zip(&want).all(|(a, b)| a.to_bits() == b.to_bits()),
+                "{r}x{c}: scalar NS5 differs from reference"
+            );
+        }
+    }
+
+    #[test]
+    fn ns5_avx512_close_to_scalar() {
+        if !crate::backend::has_avx512() {
+            eprintln!("note: avx512f absent, skipping ns5_avx512_close_to_scalar");
+            return;
+        }
+        let mut rng = Rng::new(4);
+        for &(r, c) in &NS_SHAPES {
+            let g = randmat(&mut rng, r, c);
+            let want = newton_schulz5(&g, Backend::Scalar);
+            let mx = want.data.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            for be in [Backend::Avx512, Backend::Avx512Mt] {
+                let got = newton_schulz5(&g, be);
+                let err = got
+                    .data
+                    .iter()
+                    .zip(&want.data)
+                    .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+                assert!(err <= 1e-4 * mx, "{be:?} {r}x{c}: err {err} vs max {mx}");
             }
         }
     }
@@ -372,7 +466,7 @@ mod tests {
             zero_grads(&mut g);
             last = forward(&p, &cfg, Backend::Scalar, &mut a, &batch);
             backward(&p, &cfg, Backend::Scalar, &mut a, &batch, &mut g);
-            opt.step(&mut p, &g, 1.0);
+            opt.step(&mut p, &g, 1.0, Backend::Scalar);
         }
         let end = forward(&p, &cfg, Backend::Scalar, &mut a, &batch);
         assert!(
@@ -396,7 +490,7 @@ mod tests {
         };
         let mut m = Muon::new(&[(1, 1)]);
         m.lr = 0.1;
-        m.step(0, &mut w, &g, 1.0);
+        m.step(0, &mut w, &g, 1.0, Backend::Scalar);
         assert!(w.data[0] < -0.05 && w.data[0] > -0.15, "{}", w.data[0]);
     }
 }

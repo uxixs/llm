@@ -5,7 +5,7 @@
 
 use crate::backend::{self, Backend};
 use crate::data::Batch;
-use crate::ops::scalar;
+use crate::ops::scalar::{self, RopeTable};
 use crate::rng::Rng;
 use std::io;
 use std::path::Path;
@@ -315,7 +315,9 @@ pub struct Acts {
     layers: Vec<LayerActs>,
     lnf: Vec<f32>,
     rstdf: Vec<f32>,
-    /// `1 + mtp` heads of softcapped logits `[n, V]` and their xent gradients.
+    /// `1 + mtp` heads `[n, V]`: `logits` holds softcapped logits after `forward_logits`
+    /// (main head) and is the Scalar/Blocked scratch of `backend::softcap_xent` in
+    /// `forward`; `dlogits` is d loss / d PRE-cap logits from the fused head op.
     logits: Vec<Vec<f32>>,
     dlogits: Vec<Vec<f32>>,
     /// MTP head hidden states `[n, d]`.
@@ -326,6 +328,8 @@ pub struct Acts {
     s_v: Vec<f32>,
     s_d: Vec<f32>,
     rope_buf: Vec<f32>,
+    /// RoPE angles for positions `0..ctx`, head dim `d / heads`.
+    rope: RopeTable,
     dx: Vec<f32>,
     dln: Vec<f32>,
     dlnf: Vec<f32>,
@@ -371,6 +375,7 @@ impl Acts {
             s_v: z(n * v),
             s_d: z(n * d),
             rope_buf: z(n * d),
+            rope: RopeTable::new(cfg.ctx, d / cfg.heads),
             dx: z(n * d),
             dln: z(n * d),
             dlnf: z(n * d),
@@ -381,7 +386,8 @@ impl Acts {
         }
     }
 
-    /// Main-head softcapped logits `[b·t, V]` of the last `forward`.
+    /// Main-head softcapped logits `[b·t, V]` of the last `forward_logits` (after `forward`
+    /// they are filled only on Scalar/Blocked, where they are the fused op's scratch).
     pub fn logits(&self) -> &[f32] {
         &self.logits[0]
     }
@@ -392,6 +398,7 @@ impl Acts {
 fn rope_qk(
     qkv: &mut [f32],
     scratch: &mut [f32],
+    tab: &RopeTable,
     b: usize,
     t: usize,
     c: usize,
@@ -405,9 +412,9 @@ fn rope_qk(
             s[i * c..(i + 1) * c].copy_from_slice(&qkv[i * 3 * c + part * c..][..c]);
         }
         if inverse {
-            scalar::rope_bwd(s, b, t, h, c / h);
+            scalar::rope_bwd_table(s, b, t, h, c / h, tab);
         } else {
-            scalar::rope_fwd(s, b, t, h, c / h);
+            scalar::rope_fwd_table(s, b, t, h, c / h, tab);
         }
         for i in 0..n {
             qkv[i * 3 * c + part * c..][..c].copy_from_slice(&s[i * c..(i + 1) * c]);
@@ -415,7 +422,7 @@ fn rope_qk(
     }
 }
 
-/// Embedding → blocks → final norm → main-head logits, for `b ≤ a.b`, `t ≤ a.t`.
+/// Embedding → blocks → final norm → main-head PRE-cap logits in `a.s_v`, for `b ≤ a.b`, `t ≤ a.t`.
 fn trunk(p: &Params, cfg: &Config, be: Backend, a: &mut Acts, inputs: &[u16], b: usize, t: usize) {
     assert!(
         b <= a.b && t <= a.t,
@@ -451,7 +458,7 @@ fn trunk(p: &Params, cfg: &Config, be: Backend, a: &mut Acts, inputs: &[u16], b:
             d,
             3 * d,
         );
-        rope_qk(&mut la.qkv[..n3], &mut a.rope_buf, b, t, d, h, false);
+        rope_qk(&mut la.qkv[..n3], &mut a.rope_buf, &a.rope, b, t, d, h, false);
         backend::attn_fwd(
             be,
             &mut la.attn_out[..nd],
@@ -515,7 +522,6 @@ fn trunk(p: &Params, cfg: &Config, be: Backend, a: &mut Acts, inputs: &[u16], b:
         d,
     );
     backend::matmul_fwd(be, &mut a.s_v[..n * v], &a.lnf[..nd], &p.wte.data, n, d, v);
-    scalar::softcap_fwd(&mut a.logits[0][..n * v], &a.s_v[..n * v], cfg.softcap);
 }
 
 /// Row r of `targets` (stride `t + extra`), columns `[k .. k + t]`, gathered into `out` `[b·t]`.
@@ -540,16 +546,36 @@ pub fn forward(p: &Params, cfg: &Config, be: Backend, a: &mut Acts, batch: &Batc
     assert_eq!(batch.mask.len(), n);
     trunk(p, cfg, be, a, &batch.inputs, batch.b, batch.t);
     gather_targets(&mut a.tgt, batch, 0);
-    let mut loss = scalar::xent_fwd_bwd(&mut a.dlogits[0], &a.logits[0], &a.tgt, &batch.mask, n, v);
+    let (nv, cap) = (n * v, cfg.softcap);
+    let mut loss = backend::softcap_xent(
+        be,
+        &mut a.dlogits[0],
+        &a.s_v[..nv],
+        &mut a.logits[0],
+        &a.tgt,
+        &batch.mask,
+        n,
+        v,
+        cap,
+    );
     a.n_mtp = cfg.mtp.min(batch.extra);
     if a.n_mtp > 0 {
         let mut aux = 0.0;
         for k in 1..=a.n_mtp {
             backend::matmul_fwd(be, &mut a.hk[k - 1], &a.lnf, &p.mtp[k - 1].data, n, d, d);
             backend::matmul_fwd(be, &mut a.s_v, &a.hk[k - 1], &p.wte.data, n, d, v);
-            scalar::softcap_fwd(&mut a.logits[k], &a.s_v, cfg.softcap);
             gather_targets(&mut a.tgt, batch, k);
-            aux += scalar::xent_fwd_bwd(&mut a.dlogits[k], &a.logits[k], &a.tgt, &a.ones, n, v);
+            aux += backend::softcap_xent(
+                be,
+                &mut a.dlogits[k],
+                &a.s_v,
+                &mut a.logits[k],
+                &a.tgt,
+                &a.ones,
+                n,
+                v,
+                cap,
+            );
         }
         loss += 0.5 * aux / a.n_mtp as f32;
     }
@@ -570,7 +596,9 @@ pub fn forward_logits<'a>(
 ) -> &'a [f32] {
     a.ready = false;
     trunk(p, cfg, be, a, inputs, b, t);
-    &a.logits[0][..b * t * cfg.vocab]
+    let nv = b * t * cfg.vocab;
+    scalar::softcap_fwd(&mut a.logits[0][..nv], &a.s_v[..nv], cfg.softcap);
+    &a.logits[0][..nv]
 }
 
 /// Gradient of the last `forward`'s loss. ACCUMULATES into `g` (call `g.zero()` first).
@@ -597,12 +625,12 @@ pub fn backward(
         layers,
         lnf,
         rstdf,
-        logits,
         dlogits,
         hk,
         s_v,
         s_d,
         rope_buf,
+        rope,
         dx,
         dln,
         dlnf,
@@ -616,15 +644,14 @@ pub fn backward(
     let (n, d, h, v) = (b * t, cfg.d, cfg.heads, cfg.vocab);
 
     // Heads → d(final-norm output). Tied embedding: logits matmul grads go into g.wte.
+    // dlogits already hold d loss / d pre-cap logits (softcap backward fused in forward).
     dlnf.fill(0.0);
-    s_v.fill(0.0);
-    scalar::softcap_bwd(s_v, &dlogits[0], &logits[0], cfg.softcap);
-    backend::matmul_bwd(be, dlnf, &mut g.wte.data, s_v, lnf, &p.wte.data, n, d, v);
+    backend::matmul_bwd(be, dlnf, &mut g.wte.data, &dlogits[0], lnf, &p.wte.data, n, d, v);
     for k in 1..=n_mtp {
         let w = 0.5 / n_mtp as f32;
-        s_v.fill(0.0);
-        scalar::softcap_bwd(s_v, &dlogits[k], &logits[k], cfg.softcap);
-        s_v.iter_mut().for_each(|x| *x *= w);
+        for (s, &dv) in s_v.iter_mut().zip(&dlogits[k]) {
+            *s = dv * w;
+        }
         dhk.fill(0.0);
         backend::matmul_bwd(
             be,
@@ -715,7 +742,7 @@ pub fn backward(
         );
         dqkv.fill(0.0);
         backend::attn_bwd(be, dqkv, s_d, &la.qkv, &la.att, b, t, d, h);
-        rope_qk(dqkv, rope_buf, b, t, d, h, true);
+        rope_qk(dqkv, rope_buf, rope, b, t, d, h, true);
         dln.fill(0.0);
         backend::matmul_bwd(
             be,

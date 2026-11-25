@@ -209,6 +209,91 @@ pub fn rope_at(x: &mut [f32], h: usize, d: usize, pos: usize) {
     }
 }
 
+/// Precomputed RoPE (cos, sin), `[ctx, d/2]` row-major: entry `pos * d/2 + i` is
+/// `rope_angle(pos, i, d)`, so the `*_table` ops equal the reference ops bit for bit.
+pub struct RopeTable {
+    pub cos: Vec<f32>,
+    pub sin: Vec<f32>,
+    ctx: usize,
+    d: usize,
+}
+
+impl RopeTable {
+    /// Angles for positions `0..ctx` of head dim `d` (even), via `rope_angle`.
+    pub fn new(ctx: usize, d: usize) -> RopeTable {
+        assert!(d.is_multiple_of(2), "head dim {d} must be even for RoPE");
+        let half = d / 2;
+        let (mut cos, mut sin) = (vec![0.0f32; ctx * half], vec![0.0f32; ctx * half]);
+        for pos in 0..ctx {
+            for i in 0..half {
+                let (c, s) = rope_angle(pos, i, d);
+                cos[pos * half + i] = c;
+                sin[pos * half + i] = s;
+            }
+        }
+        RopeTable { cos, sin, ctx, d }
+    }
+
+    /// (cos, sin) rows of position `pos`, each `d/2` long.
+    fn row(&self, pos: usize) -> (&[f32], &[f32]) {
+        let half = self.d / 2;
+        (&self.cos[pos * half..][..half], &self.sin[pos * half..][..half])
+    }
+}
+
+/// `rope_fwd` with angles from `tab` (`t <= tab` ctx, `d` = the table's head dim).
+pub fn rope_fwd_table(x: &mut [f32], b: usize, t: usize, h: usize, d: usize, tab: &RopeTable) {
+    rope_rotate_table(x, b, t, h, d, tab, false);
+}
+
+/// `rope_bwd` with angles from `tab`.
+pub fn rope_bwd_table(dx: &mut [f32], b: usize, t: usize, h: usize, d: usize, tab: &RopeTable) {
+    rope_rotate_table(dx, b, t, h, d, tab, true);
+}
+
+/// `rope_at` with angles from `tab` (`pos <` the table's ctx).
+pub fn rope_at_table(x: &mut [f32], h: usize, d: usize, pos: usize, tab: &RopeTable) {
+    assert_eq!(x.len(), h * d);
+    assert!(d == tab.d && pos < tab.ctx, "pos {pos}/d {d} outside RopeTable ({}, {})", tab.ctx, tab.d);
+    let (cr, sr) = tab.row(pos);
+    for hx in x.chunks_exact_mut(d) {
+        rotate_pairs(hx, cr, sr, false);
+    }
+}
+
+/// Rotates pairs (2i, 2i+1) of `x` by (cos[i], ±sin[i]); same arithmetic as `rope_rotate`.
+#[inline(always)]
+fn rotate_pairs(x: &mut [f32], cr: &[f32], sr: &[f32], inverse: bool) {
+    for ((p, &cos), &sin) in x.as_chunks_mut::<2>().0.iter_mut().zip(cr).zip(sr) {
+        let sin = if inverse { -sin } else { sin };
+        let (x0, x1) = (p[0], p[1]);
+        p[0] = x0 * cos - x1 * sin;
+        p[1] = x0 * sin + x1 * cos;
+    }
+}
+
+fn rope_rotate_table(
+    x: &mut [f32],
+    b: usize,
+    t: usize,
+    h: usize,
+    d: usize,
+    tab: &RopeTable,
+    inverse: bool,
+) {
+    assert_eq!(x.len(), b * t * h * d);
+    assert!(d == tab.d && t <= tab.ctx, "t {t}/d {d} outside RopeTable ({}, {})", tab.ctx, tab.d);
+    if d == 0 {
+        return;
+    }
+    for (row, xr) in x.chunks_exact_mut(h * d).enumerate() {
+        let (cr, sr) = tab.row(row % t);
+        for hx in xr.chunks_exact_mut(d) {
+            rotate_pairs(hx, cr, sr, inverse);
+        }
+    }
+}
+
 fn rope_rotate(x: &mut [f32], b: usize, t: usize, h: usize, d: usize, sign: f32) {
     assert_eq!(x.len(), b * t * h * d);
     for bi in 0..b {
@@ -693,5 +778,62 @@ mod tests {
             rope_at(&mut row, h, d, pos);
             assert_eq!(&row[..], &full[pos * h * d..(pos + 1) * h * d], "pos {pos}");
         }
+    }
+
+    /// Shapes (b, t, h, d) for the table-vs-reference checks; the last reaches pos 255.
+    const ROPE_SHAPES: [(usize, usize, usize, usize); 4] =
+        [(1, 1, 1, 2), (2, 7, 3, 8), (1, 33, 2, 6), (2, 256, 4, 32)];
+
+    fn bits_eq(a: &[f32], b: &[f32]) -> bool {
+        a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+    }
+
+    #[test]
+    fn rope_table_shape() {
+        let tab = RopeTable::new(256, 32);
+        assert_eq!(tab.cos.len(), 256 * 16);
+        assert_eq!(tab.sin.len(), 256 * 16);
+        assert_eq!(tab.cos[0], 1.0);
+        assert_eq!(tab.sin[0], 0.0);
+    }
+
+    #[test]
+    fn rope_fwd_bwd_table_bit_exact() {
+        let mut rng = Rng::new(17);
+        for &(b, t, h, d) in &ROPE_SHAPES {
+            // Table built for a longer context than t, as in the model (ctx >= t).
+            let tab = RopeTable::new(t + 3, d);
+            let x = randn(&mut rng, b * t * h * d);
+            let (mut want, mut got) = (x.clone(), x.clone());
+            rope_fwd(&mut want, b, t, h, d);
+            rope_fwd_table(&mut got, b, t, h, d, &tab);
+            assert!(bits_eq(&got, &want), "fwd {b}x{t}x{h}x{d}");
+            let (mut want, mut got) = (x.clone(), x);
+            rope_bwd(&mut want, b, t, h, d);
+            rope_bwd_table(&mut got, b, t, h, d, &tab);
+            assert!(bits_eq(&got, &want), "bwd {b}x{t}x{h}x{d}");
+        }
+    }
+
+    #[test]
+    fn rope_at_table_bit_exact() {
+        let (h, d) = (4, 32);
+        let tab = RopeTable::new(256, d);
+        let mut rng = Rng::new(18);
+        for pos in [0, 1, 2, 17, 100, 254, 255] {
+            let x = randn(&mut rng, h * d);
+            let (mut want, mut got) = (x.clone(), x);
+            rope_at(&mut want, h, d, pos);
+            rope_at_table(&mut got, h, d, pos, &tab);
+            assert!(bits_eq(&got, &want), "pos {pos}");
+        }
+    }
+
+    #[test]
+    #[should_panic]
+    fn rope_table_rejects_t_over_ctx() {
+        let tab = RopeTable::new(4, 8);
+        let mut x = vec![0.0f32; 5 * 8];
+        rope_fwd_table(&mut x, 1, 5, 1, 8, &tab);
     }
 }

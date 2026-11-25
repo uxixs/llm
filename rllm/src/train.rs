@@ -261,7 +261,7 @@ fn train_phase(
         let batch = next_batch();
         let loss = forward(p, cfg, be, acts, &batch);
         backward(p, cfg, be, acts, &batch, &mut g);
-        opt.step(p, &g, m);
+        opt.step(p, &g, m, be);
         let now = clock.now();
         println!(
             "{} {n} {loss:.4} {:.0} {:.2}",

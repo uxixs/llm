@@ -1,4 +1,5 @@
-//! Kernel backend selection. Only matmul and attention are dispatched.
+//! Kernel backend selection. Dispatched: matmul, attention and the fused
+//! softcap + cross-entropy head (`softcap_xent`).
 //! Scalar -> `ops::scalar`; Blocked -> `ops::blocked` matmul + scalar attention;
 //! Avx512 -> `ops::avx512`; Avx512Mt -> the `_mt` kernels on the global pool
 //! (`init_threads`/`pool`); Asm uses the single-threaded AVX-512 kernels until
@@ -215,6 +216,51 @@ pub fn attn_bwd(
     }
 }
 
+/// Fused softcap -> masked xent -> softcap backward over `n` rows of `v` pre-cap
+/// logits: returns the loss of `scalar::xent_fwd_bwd` on `cap·tanh(pre/cap)` and
+/// OVERWRITES `dpre` with the gradient w.r.t. `pre`. `scratch` (`n·v`) is used by
+/// Scalar/Blocked only (it then holds the capped logits); the AVX-512 kernels
+/// leave it untouched.
+#[allow(clippy::too_many_arguments)]
+pub fn softcap_xent(
+    be: Backend,
+    dpre: &mut [f32],
+    pre: &[f32],
+    scratch: &mut [f32],
+    targets: &[u16],
+    mask: &[f32],
+    n: usize,
+    v: usize,
+    cap: f32,
+) -> f32 {
+    match be {
+        Backend::Scalar | Backend::Blocked => {
+            assert_eq!(scratch.len(), n * v);
+            scalar::softcap_fwd(scratch, pre, cap);
+            let loss = scalar::xent_fwd_bwd(dpre, scratch, targets, mask, n, v);
+            // In place, the same arithmetic as `scalar::softcap_bwd` into zeros.
+            assert_eq!(dpre.len(), scratch.len());
+            for (d, &y) in dpre.iter_mut().zip(scratch.iter()) {
+                let t = y / cap;
+                *d = 0.0 + *d * (1.0 - t * t);
+            }
+            loss
+        }
+        #[cfg(target_arch = "x86_64")]
+        Backend::Avx512Mt => {
+            on_pool(|tp| avx512::softcap_xent_fwd_bwd_mt(tp, dpre, pre, targets, mask, n, v, cap))
+        }
+        // TODO(16): Asm -> hand-written assembly kernels.
+        #[cfg(target_arch = "x86_64")]
+        Backend::Avx512 | Backend::Asm => avx512::softcap_xent_fwd_bwd(dpre, pre, targets, mask, n, v, cap),
+        // Unreachable in practice: `check_supported` rejects these off x86_64.
+        #[cfg(not(target_arch = "x86_64"))]
+        Backend::Avx512 | Backend::Avx512Mt | Backend::Asm => {
+            softcap_xent(Backend::Scalar, dpre, pre, scratch, targets, mask, n, v, cap)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,6 +413,40 @@ mod tests {
                     a.iter().zip(r.iter()).all(|(x, y)| x.to_bits() == y.to_bits()),
                     "pool {n}: tensor {ti} differs"
                 );
+            }
+        }
+    }
+
+    /// Scalar equals the model's old chain bit for bit; AVX-512 paths are close.
+    #[test]
+    fn softcap_xent_dispatch() {
+        use crate::rng::Rng;
+        let (n, v, cap) = (37, 300, 30.0);
+        let mut rng = Rng::new(41);
+        let pre: Vec<f32> = (0..n * v).map(|_| 20.0 * rng.normal()).collect();
+        let tgt: Vec<u16> = (0..n).map(|_| rng.below(v) as u16).collect();
+        let mask: Vec<f32> = (0..n).map(|i| if i % 4 == 1 { 0.0 } else { 1.0 }).collect();
+        let mut capped = vec![0.0; n * v];
+        scalar::softcap_fwd(&mut capped, &pre, cap);
+        let mut dcap = vec![0.0; n * v];
+        let l0 = scalar::xent_fwd_bwd(&mut dcap, &capped, &tgt, &mask, n, v);
+        let mut d0 = vec![0.0; n * v];
+        scalar::softcap_bwd(&mut d0, &dcap, &capped, cap);
+        let mx = d0.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+        let mut bes = vec![Backend::Scalar, Backend::Blocked];
+        if has_avx512() {
+            bes.extend([Backend::Avx512, Backend::Avx512Mt, Backend::Asm]);
+        }
+        for be in bes {
+            let (mut d, mut s) = (vec![3.0; n * v], vec![0.0; n * v]);
+            let l = softcap_xent(be, &mut d, &pre, &mut s, &tgt, &mask, n, v, cap);
+            if matches!(be, Backend::Scalar | Backend::Blocked) {
+                assert_eq!(l.to_bits(), l0.to_bits(), "{be:?} loss");
+                assert!(d.iter().zip(&d0).all(|(a, b)| a.to_bits() == b.to_bits()), "{be:?}");
+            } else {
+                assert!((l - l0).abs() <= 1e-5 * l0.abs(), "{be:?}: loss {l} vs {l0}");
+                let err = d.iter().zip(&d0).fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+                assert!(err <= 1e-5 * mx, "{be:?}: err {err} vs max {mx}");
             }
         }
     }
