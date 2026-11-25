@@ -18,7 +18,7 @@ pub const VAL_PRETRAIN_WINDOWS: usize = 128;
 /// SFT validation: first this many records.
 pub const VAL_SFT_RECORDS: usize = 256;
 
-pub const RESULTS_HEADER: &str = "timestamp,name,backend,bitnet,mtp,params,pretrain_steps,pretrain_tokens,sft_steps,sft_tokens,train_tok_per_s,wall_s,val_loss_pretrain,val_loss_sft";
+pub const RESULTS_HEADER: &str = "timestamp,name,backend,bitnet,mtp,params,pretrain_steps,pretrain_tokens,sft_steps,sft_tokens,train_tok_per_s,wall_s,val_loss_pretrain,val_loss_sft,threads";
 
 pub trait Clock {
     /// Seconds since an arbitrary fixed origin.
@@ -117,11 +117,26 @@ pub fn run_phase(clock: &dyn Clock, budget_s: f64, mut step: impl FnMut(f32) -> 
 }
 
 /// Appends one CSV row, writing the header first if the file is missing or empty.
+/// `row` is in `RESULTS_HEADER` layout (`threads` last). If an existing file has an
+/// older header without `threads`, warns and drops the last field so the file stays
+/// well-formed.
 pub fn append_results(path: &Path, row: &str) -> io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
     let fresh = std::fs::metadata(path).map(|m| m.len() == 0).unwrap_or(true);
+    let mut row = row;
+    if !fresh {
+        let text = std::fs::read_to_string(path)?;
+        let header = text.lines().next().unwrap_or("");
+        if !header.split(',').any(|c| c == "threads") {
+            eprintln!(
+                "warning: {} has an old header without a `threads` column; writing the row without it",
+                path.display()
+            );
+            row = row.rsplit_once(',').map_or(row, |(head, _)| head);
+        }
+    }
     let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
     if fresh {
         writeln!(f, "{RESULTS_HEADER}")?;
@@ -142,7 +157,7 @@ pub struct Args {
     pub name: String,
     pub muon_lr: Option<f32>,
     pub adam_lr: Option<f32>,
-    /// Accepted for the multithreaded backend (Task 12); unused so far.
+    /// Pool size for `--backend avx512mt` (default 4).
     pub threads: Option<usize>,
 }
 
@@ -273,6 +288,8 @@ fn new_optimizer(p: &Params, args: &Args) -> Optimizer {
 
 pub fn run(args: &Args) -> Result<(), String> {
     crate::backend::check_supported(args.backend)?;
+    let threads = args.threads.unwrap_or(4);
+    crate::backend::init_threads(threads)?;
     let ioe = |what: &str, e: io::Error| format!("{what}: {e}");
     let bpe = Bpe::load(&args.data.join("tokenizer.bin")).map_err(|e| ioe("tokenizer.bin", e))?;
     let mut cfg = Config::baseline();
@@ -351,7 +368,7 @@ pub fn run(args: &Args) -> Result<(), String> {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let row = format!(
-        "{ts},{},{},{},{},{},{},{pre_tok},{},{sft_tok},{:.1},{wall:.2},{val_pre:.4},{val_sft:.4}",
+        "{ts},{},{},{},{},{},{},{pre_tok},{},{sft_tok},{:.1},{wall:.2},{val_pre:.4},{val_sft:.4},{}",
         args.name,
         format!("{:?}", args.backend).to_lowercase(),
         args.bitnet,
@@ -360,6 +377,7 @@ pub fn run(args: &Args) -> Result<(), String> {
         pre_stats.steps,
         sft_stats.steps,
         if wall > 0.0 { (pre_tok + sft_tok) as f64 / wall } else { 0.0 },
+        if args.backend == Backend::Avx512Mt { threads } else { 1 },
     );
     append_results(&Path::new("runs").join("results.csv"), &row).map_err(|e| ioe("results.csv", e))?;
     println!("train time {wall:.1}s, row appended to runs/results.csv");
@@ -449,6 +467,30 @@ mod tests {
         let lines: Vec<&str> = s.lines().collect();
         assert_eq!(lines, vec![RESULTS_HEADER, "a,1", "b,2"]);
         assert_eq!(s.matches("timestamp").count(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn results_csv_threads_column_backward_compat() {
+        assert!(RESULTS_HEADER.ends_with(",threads"));
+        let dir = std::env::temp_dir().join(format!("rllm_csv_thr_{}", std::process::id()));
+        let p = dir.join("runs").join("results.csv");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        // Old-format file: header without `threads`.
+        let old = RESULTS_HEADER.strip_suffix(",threads").unwrap();
+        std::fs::write(&p, format!("{old}
+old,1,2
+")).unwrap();
+        append_results(&p, "new,3,4,8").unwrap();
+        let s = std::fs::read_to_string(&p).unwrap();
+        let lines: Vec<&str> = s.lines().collect();
+        assert_eq!(lines, vec![old, "old,1,2", "new,3,4"], "row must drop threads");
+        std::fs::remove_dir_all(&dir).ok();
+        // Fresh file: new header, full row.
+        append_results(&p, "a,1,4").unwrap();
+        let s = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(s.lines().collect::<Vec<_>>(), vec![RESULTS_HEADER, "a,1,4"]);
         std::fs::remove_dir_all(&dir).ok();
     }
 

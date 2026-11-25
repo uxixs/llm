@@ -10,6 +10,12 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // Avx512Mt rows use private pools per thread count; the global pool is
+    // initialised for consistency with train/chat.
+    if let Err(e) = rllm::backend::init_threads(args.threads[0]) {
+        eprintln!("error: {e}");
+        return ExitCode::from(2);
+    }
     let md = report(&args);
     print!("{md}");
     if args.quick {

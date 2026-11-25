@@ -262,9 +262,11 @@ pub struct ChatArgs {
     pub kernel: Kernel,
     pub batch: Option<PathBuf>,
     pub seed: u64,
+    /// Pool size for `--backend avx512mt` (default 4).
+    pub threads: usize,
 }
 
-pub const CHAT_USAGE: &str = "usage: chat --model runs/<run>/model.bin [--tokenizer data/tokenizer.bin] [--backend scalar|blocked|avx512|avx512mt|asm] [--temp 0.8] [--top-p 0.9] [--kernel fp32|ternary] [--batch questions.txt] [--seed 1]";
+pub const CHAT_USAGE: &str = "usage: chat --model runs/<run>/model.bin [--tokenizer data/tokenizer.bin] [--backend scalar|blocked|avx512|avx512mt|asm] [--temp 0.8] [--top-p 0.9] [--kernel fp32|ternary] [--batch questions.txt] [--seed 1] [--threads 4]";
 
 impl ChatArgs {
     pub fn parse(mut it: impl Iterator<Item = String>) -> Result<ChatArgs, String> {
@@ -277,6 +279,7 @@ impl ChatArgs {
             kernel: Kernel::Fp32,
             batch: None,
             seed: 1,
+            threads: 4,
         };
         let mut have_model = false;
         fn num<T: std::str::FromStr>(f: &str, v: Option<String>) -> Result<T, String> {
@@ -294,6 +297,7 @@ impl ChatArgs {
                 "--temp" => a.temp = num(&f, it.next())?,
                 "--top-p" => a.top_p = num(&f, it.next())?,
                 "--seed" => a.seed = num(&f, it.next())?,
+                "--threads" => a.threads = num(&f, it.next())?,
                 "--batch" => a.batch = Some(it.next().ok_or("--batch needs a value")?.into()),
                 "--kernel" => {
                     a.kernel = match it.next().as_deref() {
@@ -384,6 +388,7 @@ pub fn run_chat(
 ) -> Result<(), String> {
     let io = |e: std::io::Error| e.to_string();
     backend::check_supported(args.backend)?;
+    backend::init_threads(args.threads)?;
     if args.kernel == Kernel::Ternary {
         return Err("--kernel ternary is not implemented yet (planned for the ternary-kernel task)".into());
     }
@@ -707,6 +712,7 @@ mod tests {
             kernel: Kernel::Fp32,
             batch: None,
             seed: 1,
+            threads: 4,
         }
     }
 

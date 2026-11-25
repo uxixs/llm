@@ -9,6 +9,7 @@ use crate::data::Batch;
 use crate::model::{backward, forward, Acts, Config, Params};
 use crate::ops::scalar;
 use crate::optim::Optimizer;
+use crate::pool::ThreadPool;
 use crate::rng::Rng;
 use std::hint::black_box;
 use std::time::Instant;
@@ -260,12 +261,10 @@ pub fn profile_step_with(
     let mut qkv_work = qkv.clone();
     let mut dg = vec![0.0f32; d];
     let mut rs = rstd.clone();
-    // Gradients are accumulated into freely (values are irrelevant to timing).
-    for tn in g.tensors_mut() {
-        tn.iter_mut().for_each(|v| *v = 1e-3 * rng.normal());
-    }
 
     let mut step = || -> [f64; OPS.len()] {
+        // Gradients accumulate; re-zero them each step, outside every timer.
+        g.zero();
         let mut tm = [0.0f64; OPS.len()];
         let tl = &mut tm;
         // Forward.
@@ -297,8 +296,8 @@ pub fn profile_step_with(
         });
 
         // Backward.
+        sv.fill(0.0);
         timed(&mut tl[CAP], || {
-            sv.fill(0.0);
             scalar::softcap_bwd(&mut sv, &dlogits, &capped, cfg.softcap);
         });
         dln.fill(0.0);
@@ -384,19 +383,35 @@ pub fn civil_date(unix_secs: u64) -> (i64, u32, u32) {
 #[derive(Clone, Debug)]
 pub struct BenchArgs {
     pub backends: Vec<Backend>,
-    pub threads: usize,
+    /// Pool sizes for the Avx512Mt rows (deduplicated, order kept).
+    pub threads: Vec<usize>,
     pub profile: bool,
     pub quick: bool,
 }
 
-pub const BENCH_USAGE: &str = "usage: bench [--backend scalar,blocked,avx512,avx512mt,asm|all] [--threads 4] [--profile-step] [--quick]\n  --quick: tiny shapes, 1 warmup, 1 rep; printed only, not appended to bench/results.md";
+pub const BENCH_USAGE: &str = "usage: bench [--backend scalar,blocked,avx512,avx512mt,asm|all] [--threads 4[,8,...]] [--profile-step] [--quick]\n  --quick: tiny shapes, 1 warmup, 1 rep; printed only, not appended to bench/results.md";
 
 const ALL: [Backend; 5] =
     [Backend::Scalar, Backend::Blocked, Backend::Avx512, Backend::Avx512Mt, Backend::Asm];
 
+/// Parses `4` or `4,8` into pool sizes (each >= 1; duplicates dropped, order kept).
+pub fn parse_threads(v: &str) -> Result<Vec<usize>, String> {
+    let mut out: Vec<usize> = Vec::new();
+    for part in v.split(',') {
+        let n: usize = part.parse().map_err(|_| format!("bad value {v:?} for --threads"))?;
+        if n == 0 {
+            return Err("--threads must be >= 1".into());
+        }
+        if !out.contains(&n) {
+            out.push(n);
+        }
+    }
+    Ok(out)
+}
+
 impl BenchArgs {
     pub fn parse(mut it: impl Iterator<Item = String>) -> Result<BenchArgs, String> {
-        let mut a = BenchArgs { backends: ALL.to_vec(), threads: 4, profile: false, quick: false };
+        let mut a = BenchArgs { backends: ALL.to_vec(), threads: vec![4], profile: false, quick: false };
         while let Some(f) = it.next() {
             match f.as_str() {
                 "--backend" => {
@@ -409,10 +424,7 @@ impl BenchArgs {
                 }
                 "--threads" => {
                     let v = it.next().ok_or("--threads needs a value")?;
-                    a.threads = v.parse().map_err(|_| format!("bad value {v:?} for --threads"))?;
-                    if a.threads == 0 {
-                        return Err("--threads must be >= 1".into());
-                    }
+                    a.threads = parse_threads(&v)?;
                 }
                 "--profile-step" => a.profile = true,
                 "--quick" => a.quick = true,
@@ -440,18 +452,24 @@ pub fn report(args: &BenchArgs) -> String {
         .unwrap_or(0);
     let (y, mo, da) = civil_date(now);
 
+    let tl: Vec<String> = args.threads.iter().map(|n| n.to_string()).collect();
     let mut md = format!(
-        "## bench {y:04}-{mo:02}-{da:02}{}\n\nthreads: {}; step: b={b}, t={t}, d={}, layers={}\n\n",
+        "## bench {y:04}-{mo:02}-{da:02}{}\n\nthreads (Avx512Mt): {}; step: b={b}, t={t}, d={}, layers={}\n\n",
         if args.quick { " (quick, not a measurement)" } else { "" },
-        args.threads,
+        tl.join(","),
         cfg.d,
         cfg.layers,
     );
-    let (p1, pn) = (fma_peak_gflops(1, peak_secs), fma_peak_gflops(args.threads, peak_secs));
-    md += &format!(
-        "| measured FMA peak | GFLOPS |\n|---|---|\n| 1 thread | {p1:.1} |\n| {} threads | {pn:.1} |\n\n",
-        args.threads
-    );
+    let p1 = fma_peak_gflops(1, peak_secs);
+    let peaks: Vec<f64> = args.threads.iter().map(|&n| fma_peak_gflops(n, peak_secs)).collect();
+    md += "| measured FMA peak | GFLOPS |\n|---|---|\n";
+    md += &format!("| 1 thread | {p1:.1} |\n");
+    for (&n, pk) in args.threads.iter().zip(&peaks) {
+        if n != 1 {
+            md += &format!("| {n} threads | {pk:.1} |\n");
+        }
+    }
+    md += "\n";
 
     let mut run: Vec<Backend> = Vec::new();
     for &be in &args.backends {
@@ -460,8 +478,29 @@ pub fn report(args: &BenchArgs) -> String {
             Err(e) => md += &format!("skipped {be:?}: {e}\n\n"),
         }
     }
-    let pct = |g: f64, be: Backend| {
-        let peak = if be == Backend::Avx512Mt { pn } else { p1 };
+    // One entry per table row: single-threaded backends once (threads = 1), Avx512Mt
+    // once per requested thread count (with a private pool of that size).
+    let mut combos: Vec<(Backend, usize, f64)> = Vec::new();
+    for &be in &run {
+        if be == Backend::Avx512Mt {
+            for (&n, &pk) in args.threads.iter().zip(&peaks) {
+                combos.push((be, n, pk));
+            }
+        } else {
+            combos.push((be, 1, p1));
+        }
+    }
+    // Runs `f` with the right pool for (be, n).
+    let with = |be: Backend, n: usize| -> Option<ThreadPool> {
+        (be == Backend::Avx512Mt).then(|| ThreadPool::new(n))
+    };
+    fn call<R>(tp: &Option<ThreadPool>, f: impl FnOnce() -> R) -> R {
+        match tp {
+            Some(tp) => backend::with_pool(tp, f),
+            None => f(),
+        }
+    }
+    let pct = |g: f64, peak: f64| {
         if peak > 0.0 {
             format!("{:.0}%", 100.0 * g / peak)
         } else {
@@ -469,32 +508,38 @@ pub fn report(args: &BenchArgs) -> String {
         }
     };
 
-    md += "| matmul (n,k,m) | backend | fwd GFLOPS | fwd % of peak | bwd GFLOPS | bwd % of peak |\n|---|---|---|---|---|---|\n";
+    md += "| matmul (n,k,m) | backend | threads | fwd GFLOPS | fwd % of peak | bwd GFLOPS | bwd % of peak |\n|---|---|---|---|---|---|---|\n";
     for &(n, k, m) in shapes {
-        for &be in &run {
-            let f = matmul_gflops_with(be, n, k, m, Which::Fwd, warm, reps);
-            let bw = matmul_gflops_with(be, n, k, m, Which::Bwd, warm, reps);
+        for &(be, nt, peak) in &combos {
+            let tp = with(be, nt);
+            let f = call(&tp, || matmul_gflops_with(be, n, k, m, Which::Fwd, warm, reps));
+            let bw = call(&tp, || matmul_gflops_with(be, n, k, m, Which::Bwd, warm, reps));
             md += &format!(
-                "| ({n},{k},{m}) | {be:?} | {f:.1} | {} | {bw:.1} | {} |\n",
-                pct(f, be),
-                pct(bw, be)
+                "| ({n},{k},{m}) | {be:?} | {nt} | {f:.1} | {} | {bw:.1} | {} |\n",
+                pct(f, peak),
+                pct(bw, peak)
             );
         }
     }
-    md += "\n(% of peak: 1-thread FMA peak, except Avx512Mt vs the N-thread peak)\n\n";
+    md += "\n(% of peak: FMA peak with the same thread count as the row. Asm is single-threaded until Task 16.)\n\n";
 
-    md += "| backend | train step tok/s | ms/step |\n|---|---|---|\n";
-    for &be in &run {
-        let tps = train_step_tok_per_s_with(be, &cfg, b, t, warm, reps);
-        md += &format!("| {be:?} | {tps:.0} | {:.2} |\n", 1e3 * (b * t) as f64 / tps);
+    md += "| backend | threads | train step tok/s | ms/step |\n|---|---|---|---|\n";
+    for &(be, nt, _) in &combos {
+        let tp = with(be, nt);
+        let tps = call(&tp, || train_step_tok_per_s_with(be, &cfg, b, t, warm, reps));
+        md += &format!("| {be:?} | {nt} | {tps:.0} | {:.2} |\n", 1e3 * (b * t) as f64 / tps);
     }
     md += "\n";
 
     if args.profile {
-        for &be in &run {
-            let prof = profile_step_with(be, &cfg, b, t, warm, reps);
+        for &(be, nt, _) in &combos {
+            let tp = with(be, nt);
+            let prof = call(&tp, || profile_step_with(be, &cfg, b, t, warm, reps));
             let total = prof.last().map(|(_, s)| *s).unwrap_or(0.0).max(f64::MIN_POSITIVE);
-            md += &format!("per-op profile, {be:?}\n\n| op | ms | % |\n|---|---|---|\n");
+            md += &format!(
+                "per-op profile, {be:?}, {nt} thread{}\n\n| op | ms | % |\n|---|---|---|\n",
+                if nt == 1 { "" } else { "s" }
+            );
             for (name, s) in &prof {
                 md += &format!("| {name} | {:.3} | {:.1}% |\n", 1e3 * s, 100.0 * s / total);
             }
@@ -546,16 +591,44 @@ mod tests {
     fn parse_args() {
         let a = |v: &[&str]| BenchArgs::parse(v.iter().map(|s| s.to_string()));
         let d = a(&[]).unwrap();
-        assert_eq!(d.threads, 4);
+        assert_eq!(d.threads, vec![4]);
         assert!(!d.quick && !d.profile);
         assert_eq!(d.backends.len(), 5);
         let x = a(&["--backend", "scalar,blocked", "--threads", "2", "--quick", "--profile-step"]).unwrap();
         assert_eq!(x.backends, vec![Backend::Scalar, Backend::Blocked]);
-        assert_eq!(x.threads, 2);
+        assert_eq!(x.threads, vec![2]);
         assert!(x.quick && x.profile);
         assert!(a(&["--backend", "nope"]).is_err());
         assert!(a(&["--threads", "0"]).is_err());
         assert!(a(&["--wat"]).is_err());
+    }
+
+    #[test]
+    fn bench_threads_list_parse() {
+        let a = |v: &[&str]| BenchArgs::parse(v.iter().map(|s| s.to_string()));
+        assert_eq!(a(&["--threads", "4,8"]).unwrap().threads, vec![4, 8]);
+        assert_eq!(a(&["--threads", "1"]).unwrap().threads, vec![1]);
+        assert_eq!(a(&["--threads", "8,4,8"]).unwrap().threads, vec![8, 4]); // dedup, order kept
+        assert!(a(&["--threads", "4,0"]).is_err());
+        assert!(a(&["--threads", "4,"]).is_err());
+        assert!(a(&["--threads", "x"]).is_err());
+        assert!(a(&["--threads"]).is_err());
+    }
+
+    #[test]
+    fn report_labels_thread_counts() {
+        let args = BenchArgs {
+            backends: vec![Backend::Scalar, Backend::Avx512Mt],
+            threads: vec![1, 2],
+            profile: false,
+            quick: true,
+        };
+        let md = report(&args);
+        if has_avx512() {
+            assert!(md.contains("| Avx512Mt | 1 |") && md.contains("| Avx512Mt | 2 |"), "{md}");
+        }
+        assert!(md.contains("| Scalar | 1 |"), "{md}");
+        assert!(md.contains("single-threaded until Task 16"), "{md}");
     }
 
     #[test]
@@ -600,7 +673,7 @@ mod tests {
     fn report_quick_has_tables() {
         let args = BenchArgs {
             backends: vec![Backend::Scalar, Backend::Blocked],
-            threads: 2,
+            threads: vec![2],
             profile: true,
             quick: true,
         };
