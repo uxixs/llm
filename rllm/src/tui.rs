@@ -459,6 +459,126 @@ const HELP: &str = "\
 /quit, /exit   leave (also Ctrl+C at the prompt, or Ctrl+Z then Enter)
 Ctrl+C while the assistant is replying stops that reply.";
 
+/// One trained run under `runs/`, for the startup picker.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RunInfo {
+    pub name: String,
+    pub model: PathBuf,
+    /// Seconds since `model.bin` was written.
+    pub age_s: u64,
+    pub val_pre: Option<f64>,
+    pub val_sft: Option<f64>,
+}
+
+/// Runs with a `model.bin`, newest first, with validation losses from `results.csv`
+/// (the last row for a name wins).
+pub fn list_runs(dir: &Path) -> Vec<RunInfo> {
+    let mut losses = std::collections::HashMap::new();
+    if let Ok(csv) = std::fs::read_to_string(dir.join("results.csv")) {
+        let mut lines = csv.lines();
+        let header: Vec<&str> = lines.next().unwrap_or("").split(',').collect();
+        let col = |n: &str| header.iter().position(|h| *h == n);
+        if let (Some(ni), Some(pi), Some(si)) = (col("name"), col("val_loss_pretrain"), col("val_loss_sft")) {
+            for l in lines {
+                let f: Vec<&str> = l.split(',').collect();
+                let num = |i: usize| f.get(i).and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite());
+                if let Some(n) = f.get(ni) {
+                    losses.insert(n.to_string(), (num(pi), num(si)));
+                }
+            }
+        }
+    }
+    let now = std::time::SystemTime::now();
+    let mut runs: Vec<(std::time::SystemTime, RunInfo)> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| {
+            let e = e.ok()?;
+            let model = e.path().join("model.bin");
+            let t = std::fs::metadata(&model).ok()?.modified().ok()?;
+            let name = e.file_name().to_string_lossy().into_owned();
+            let (val_pre, val_sft) = losses.get(&name).copied().unwrap_or((None, None));
+            let age_s = now.duration_since(t).map(|d| d.as_secs()).unwrap_or(0);
+            Some((t, RunInfo { name, model, age_s, val_pre, val_sft }))
+        })
+        .collect();
+    runs.sort_by(|a, b| b.0.cmp(&a.0));
+    runs.into_iter().map(|(_, r)| r).collect()
+}
+
+/// `45s`, `12m`, `3h`, `2d`
+pub fn fmt_age(s: u64) -> String {
+    match s {
+        0..=59 => format!("{s}s"),
+        60..=3599 => format!("{}m", s / 60),
+        3600..=86_399 => format!("{}h", s / 3600),
+        _ => format!("{}d", s / 86_400),
+    }
+}
+
+/// Numbered list of runs for the startup picker; the first (newest) is the default.
+pub fn fmt_run_menu(style: &Style, runs: &[RunInfo]) -> String {
+    let wname = runs.iter().map(|r| str_width(&r.name)).max().unwrap_or(0);
+    let loss = |v: Option<f64>| v.map_or("  -  ".to_string(), |v| format!("{v:.2}"));
+    let mut out = format!("{}\n\n", style.accent("✻ Choose a model"));
+    for (i, r) in runs.iter().enumerate() {
+        let marker = if i == 0 { style.accent("❯") } else { " ".to_string() };
+        let pad = " ".repeat(wname - str_width(&r.name));
+        let info = style.dim(&format!(
+            "{:>4} ago · val pretrain {} · sft {}",
+            fmt_age(r.age_s),
+            loss(r.val_pre),
+            loss(r.val_sft)
+        ));
+        let name = if i == 0 { style.bold(&r.name) } else { r.name.clone() };
+        out.push_str(&format!(" {marker} {:>2}. {name}{pad}  {info}\n", i + 1));
+    }
+    out.push_str(&format!("\n{}\n", style.dim("  Enter = 1 (newest) · number to pick · q to quit")));
+    out
+}
+
+/// Reads the picker answer: empty = first run, `1..=n` = that run, `q` = quit (None).
+pub fn parse_choice(line: &str, n: usize) -> Result<Option<usize>, String> {
+    let t = line.trim();
+    if t.is_empty() {
+        return Ok(Some(0));
+    }
+    if t.eq_ignore_ascii_case("q") || t == "/quit" {
+        return Ok(None);
+    }
+    match t.parse::<usize>() {
+        Ok(k) if (1..=n).contains(&k) => Ok(Some(k - 1)),
+        _ => Err(format!("pick a number from 1 to {n}, Enter for 1, or q")),
+    }
+}
+
+/// Shows the picker on `out` and reads answers from `input` until one is valid.
+/// Ok(None) when the user quits or input ends.
+pub fn pick_run(
+    runs: &[RunInfo],
+    input: &mut dyn BufRead,
+    out: &mut dyn Write,
+    style: &Style,
+) -> std::io::Result<Option<usize>> {
+    write!(out, "{}", fmt_run_menu(style, runs))?;
+    let mut line = String::new();
+    loop {
+        write!(out, "{} ", style.accent(">"))?;
+        out.flush()?;
+        line.clear();
+        if input.read_line(&mut line)? == 0 {
+            return Ok(None);
+        }
+        match parse_choice(&line, runs.len()) {
+            Ok(c) => {
+                writeln!(out)?;
+                return Ok(c);
+            }
+            Err(e) => writeln!(out, "{}", note(style, &e, true))?,
+        }
+    }
+}
+
 /// A system note under the last block: `  ⎿  text`, continuation lines aligned.
 fn note(style: &Style, text: &str, error: bool) -> String {
     let body = text.replace('\n', "\n     ");
@@ -757,6 +877,69 @@ mod tests {
         std::fs::create_dir_all(dir.join("empty")).unwrap();
         assert_eq!(find_latest_model(&dir), Some(dir.join("new").join("model.bin")));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn list_runs_newest_first_with_losses() {
+        let dir = std::env::temp_dir().join(format!("rllm_tui_runs_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let now = SystemTime::now();
+        for (name, age) in [("old", 7200), ("new", 30), ("mid", 600)] {
+            let d = dir.join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            let f = std::fs::File::create(d.join("model.bin")).unwrap();
+            f.set_modified(now - Duration::from_secs(age)).unwrap();
+        }
+        std::fs::create_dir_all(dir.join("no-model")).unwrap();
+        std::fs::write(
+            dir.join("results.csv"),
+            "timestamp,name,val_loss_pretrain,val_loss_sft\n1,new,9.0,9.0\n2,new,3.13,3.78\n3,old,NaN,4.5\n",
+        )
+        .unwrap();
+        let runs = list_runs(&dir);
+        let names: Vec<&str> = runs.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["new", "mid", "old"]);
+        assert_eq!((runs[0].val_pre, runs[0].val_sft), (Some(3.13), Some(3.78)), "last row wins");
+        assert_eq!((runs[1].val_pre, runs[1].val_sft), (None, None));
+        assert_eq!((runs[2].val_pre, runs[2].val_sft), (None, Some(4.5)), "NaN shown as missing");
+        assert_eq!(runs[0].model, dir.join("new").join("model.bin"));
+        assert!(list_runs(&dir.join("nope")).is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn choice_parsing() {
+        assert_eq!(parse_choice("\n", 3), Ok(Some(0)));
+        assert_eq!(parse_choice(" 2 ", 3), Ok(Some(1)));
+        assert_eq!(parse_choice("3", 3), Ok(Some(2)));
+        assert_eq!(parse_choice("q", 3), Ok(None));
+        assert_eq!(parse_choice("Q", 3), Ok(None));
+        for bad in ["0", "4", "-1", "abc", "1.5"] {
+            assert!(parse_choice(bad, 3).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn picker_menu_and_retry() {
+        let runs = vec![
+            RunInfo { name: "tiny-mem".into(), model: "runs/tiny-mem/model.bin".into(), age_s: 90, val_pre: Some(2.56), val_sft: Some(3.2) },
+            RunInfo { name: "reddit".into(), model: "runs/reddit/model.bin".into(), age_s: 7200, val_pre: None, val_sft: None },
+        ];
+        let s = Style { color: false };
+        let menu = fmt_run_menu(&s, &runs);
+        assert!(!menu.contains('\x1b'));
+        for want in ["1. tiny-mem", "2. reddit", "1m ago", "2h ago", "2.56", "3.20", "Enter = 1"] {
+            assert!(menu.contains(want), "missing {want:?} in {menu}");
+        }
+        let mut out = Vec::new();
+        let mut input = std::io::Cursor::new(b"7\nzz\n2\n".to_vec());
+        assert_eq!(pick_run(&runs, &mut input, &mut out, &s).unwrap(), Some(1));
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(out.matches("pick a number").count(), 2, "{out}");
+        let mut eof = std::io::Cursor::new(Vec::new());
+        assert_eq!(pick_run(&runs, &mut eof, &mut Vec::new(), &s).unwrap(), None);
+        assert_eq!(fmt_age(59), "59s");
+        assert_eq!(fmt_age(86_400 * 3), "3d");
     }
 
     #[test]

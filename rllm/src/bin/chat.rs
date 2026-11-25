@@ -1,22 +1,47 @@
 use rllm::infer::{run_chat, ChatArgs, CHAT_USAGE};
-use rllm::tui::{find_latest_model, init_console, run_tui, CANCEL};
-use std::io::{stderr, stdin, stdout};
+use rllm::tui::{find_latest_model, init_console, list_runs, pick_run, run_tui, Style, CANCEL};
+use std::io::{stderr, stdin, stdout, IsTerminal};
 use std::path::Path;
 use std::process::ExitCode;
 
+const NO_MODEL: &str = "모델이 없어요. 먼저 `train --name <run>`으로 학습하세요\n\
+                        No model found under runs/. Train one first: train --name <run>";
+
 fn main() -> ExitCode {
     let mut argv: Vec<String> = std::env::args().skip(1).collect();
+    let batch = argv.iter().any(|a| a == "--batch");
+    // Interactive start without --model: let the user choose a run; otherwise the newest.
+    let interactive = !batch && stdin().is_terminal() && stdout().is_terminal();
+    let mut style: Option<Style> = None;
     if !argv.iter().any(|a| a == "--model") {
-        match find_latest_model(Path::new("runs")) {
+        let model = if interactive {
+            let runs = list_runs(Path::new("runs"));
+            match runs.len() {
+                0 => None,
+                1 => Some(runs[0].model.clone()),
+                _ => {
+                    let s = init_console();
+                    style = Some(s);
+                    match pick_run(&runs, &mut stdin().lock(), &mut stdout().lock(), &s) {
+                        Ok(Some(i)) => Some(runs[i].model.clone()),
+                        Ok(None) => return ExitCode::SUCCESS,
+                        Err(e) => {
+                            eprintln!("error: {e}");
+                            return ExitCode::FAILURE;
+                        }
+                    }
+                }
+            }
+        } else {
+            find_latest_model(Path::new("runs"))
+        };
+        match model {
             Some(m) => {
                 argv.push("--model".into());
                 argv.push(m.to_string_lossy().into_owned());
             }
             None => {
-                eprintln!(
-                    "모델이 없어요. 먼저 `train --name <run>`으로 학습하세요\n\
-                     No model found under runs/. Train one first: train --name <run>"
-                );
+                eprintln!("{NO_MODEL}");
                 return ExitCode::FAILURE;
             }
         }
@@ -41,7 +66,7 @@ fn main() -> ExitCode {
     let result = if args.batch.is_some() {
         run_chat(&args, &mut stdin().lock(), &mut stdout().lock(), &mut stderr().lock())
     } else {
-        let style = init_console();
+        let style = style.unwrap_or_else(init_console);
         run_tui(args, &mut stdin().lock(), &mut stdout().lock(), style, &CANCEL)
     };
     match result {
