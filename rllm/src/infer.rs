@@ -213,8 +213,11 @@ impl StreamDecoder {
 }
 
 /// `<|user|>u<|assistant|>a<|end|>` per past turn, then `<|user|>user<|assistant|>`.
-/// Drops the oldest turns until `len <= ctx - reserve`; if the new message alone is still too
-/// long, keeps its last `ctx - reserve - 2` tokens inside the user/assistant wrapper.
+/// When the history does not fit in `ctx - reserve`, turns are dropped from the second-oldest
+/// on, keeping the first turn (where people usually introduce themselves) as long as it fits
+/// together with the newest turn; otherwise the oldest turns are dropped first. If the new
+/// message alone is still too long, keeps its last `ctx - reserve - 2` tokens inside the
+/// user/assistant wrapper.
 pub fn build_prompt(
     history: &[(Vec<u16>, Vec<u16>)],
     user: &[u16],
@@ -223,21 +226,32 @@ pub fn build_prompt(
     reserve: usize,
 ) -> Vec<u16> {
     let limit = ctx.saturating_sub(reserve);
-    let mut start = 0;
-    while start < history.len() {
-        let len: usize = history[start..].iter().map(|(u, a)| 3 + u.len() + a.len()).sum();
-        if len + 2 + user.len() <= limit {
-            break;
+    let tlen = |t: &(Vec<u16>, Vec<u16>)| 3 + t.0.len() + t.1.len();
+    let fits = |turns: &[&(Vec<u16>, Vec<u16>)]| turns.iter().map(|t| tlen(t)).sum::<usize>() + 2 + user.len() <= limit;
+    let all: Vec<&(Vec<u16>, Vec<u16>)> = history.iter().collect();
+    let kept: Vec<&(Vec<u16>, Vec<u16>)> = if fits(&all) {
+        all
+    } else if history.len() >= 3 && fits(&[&history[0], &history[history.len() - 1]]) {
+        // pin the first turn, then as many of the newest turns as fit
+        let mut start = history.len() - 1;
+        while start > 2 && fits(&std::iter::once(&history[0]).chain(&history[start - 1..]).collect::<Vec<_>>()) {
+            start -= 1;
         }
-        start += 1;
-    }
-    let user = if history[start..].is_empty() && user.len() + 2 > limit {
+        std::iter::once(&history[0]).chain(&history[start..]).collect()
+    } else {
+        let mut start = 0;
+        while start < history.len() && !fits(&history[start..].iter().collect::<Vec<_>>()) {
+            start += 1;
+        }
+        history[start..].iter().collect()
+    };
+    let user = if kept.is_empty() && user.len() + 2 > limit {
         &user[user.len() - limit.saturating_sub(2).min(user.len())..]
     } else {
         user
     };
     let mut out = Vec::new();
-    for (u, a) in &history[start..] {
+    for (u, a) in kept {
         out.push(bpe.user());
         out.extend_from_slice(u);
         out.push(bpe.assistant());
@@ -693,6 +707,25 @@ mod tests {
         // With a big window nothing is dropped.
         let all = build_prompt(&history, &user, &bpe, 1000, 64);
         assert_eq!(all.len(), 3 * turn(10, 10) + 2 + 5);
+    }
+
+    #[test]
+    fn prompt_keeps_first_turn_when_dropping_middle() {
+        let bpe = bpe300();
+        let mk = |tag: u16, n: usize| vec![tag; n];
+        // Four turns of 13 tokens; budget 50 holds the first + two newest + user (13*3+2+5=46).
+        let history: Vec<_> = (0..4).map(|i| (mk(10 + 2 * i, 5), mk(11 + 2 * i, 5))).collect();
+        let user = mk(7, 5);
+        let got = build_prompt(&history, &user, &bpe, 50 + 64, 64);
+        assert_eq!(got.len(), 3 * turn(5, 5) + 2 + 5);
+        let tags: Vec<u16> = got.iter().copied().filter(|&t| (10..=17).contains(&t)).collect();
+        let mut want = mk(10, 5);
+        want.extend(mk(11, 5));
+        for i in 2..4u16 {
+            want.extend(mk(10 + 2 * i, 5));
+            want.extend(mk(11 + 2 * i, 5));
+        }
+        assert_eq!(tags, want, "first turn, then the newest turns; turn 1 dropped");
     }
 
     #[test]
