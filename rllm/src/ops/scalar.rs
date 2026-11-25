@@ -177,6 +177,134 @@ pub fn xent_fwd_bwd(
     (loss / msum as f64) as f32
 }
 
+/// (cos, sin) of `pos * 10000^(-2i/d)`.
+fn rope_angle(pos: usize, i: usize, d: usize) -> (f32, f32) {
+    let theta = 10000f32.powf(-2.0 * i as f32 / d as f32);
+    let a = pos as f32 * theta;
+    (a.cos(), a.sin())
+}
+
+/// In-place rotary embedding on `[b,t,h,d]`; pair (2i, 2i+1) rotates by `t * 10000^(-2i/d)`.
+pub fn rope_fwd(x: &mut [f32], b: usize, t: usize, h: usize, d: usize) {
+    rope_rotate(x, b, t, h, d, 1.0);
+}
+
+/// Inverse rotation in place (the transpose of `rope_fwd`'s rotation), for gradients.
+pub fn rope_bwd(dx: &mut [f32], b: usize, t: usize, h: usize, d: usize) {
+    rope_rotate(dx, b, t, h, d, -1.0);
+}
+
+fn rope_rotate(x: &mut [f32], b: usize, t: usize, h: usize, d: usize, sign: f32) {
+    assert_eq!(x.len(), b * t * h * d);
+    for bi in 0..b {
+        for ti in 0..t {
+            for hi in 0..h {
+                let base = ((bi * t + ti) * h + hi) * d;
+                for i in 0..d / 2 {
+                    let (cos, sin) = rope_angle(ti, i, d);
+                    let sin = sign * sin;
+                    let (x0, x1) = (x[base + 2 * i], x[base + 2 * i + 1]);
+                    x[base + 2 * i] = x0 * cos - x1 * sin;
+                    x[base + 2 * i + 1] = x0 * sin + x1 * cos;
+                }
+            }
+        }
+    }
+}
+
+/// Causal multi-head attention. `qkv` `[b,t,3c]` (q|k|v, head h at cols h*d..), `out` `[b,t,c]`,
+/// `att` `[b,h,t,t]` probabilities (future entries are 0). Scale 1/sqrt(c/h).
+pub fn attn_fwd(
+    out: &mut [f32],
+    att: &mut [f32],
+    qkv: &[f32],
+    b: usize,
+    t: usize,
+    c: usize,
+    h: usize,
+) {
+    let d = c / h;
+    let scale = 1.0 / (d as f32).sqrt();
+    let c3 = 3 * c;
+    att.fill(0.0);
+    out.fill(0.0);
+    for bi in 0..b {
+        for hi in 0..h {
+            for tq in 0..t {
+                let q = &qkv[(bi * t + tq) * c3 + hi * d..][..d];
+                let row = &mut att[((bi * h + hi) * t + tq) * t..][..t];
+                let mut max = f32::NEG_INFINITY;
+                for s in 0..=tq {
+                    let k = &qkv[(bi * t + s) * c3 + c + hi * d..][..d];
+                    let dot: f32 = q.iter().zip(k).map(|(a, b)| a * b).sum();
+                    row[s] = dot * scale;
+                    max = max.max(row[s]);
+                }
+                let mut sum = 0.0;
+                for p in &mut row[..=tq] {
+                    *p = (*p - max).exp();
+                    sum += *p;
+                }
+                let o = &mut out[(bi * t + tq) * c + hi * d..][..d];
+                for s in 0..=tq {
+                    row[s] /= sum;
+                    let v = &qkv[(bi * t + s) * c3 + 2 * c + hi * d..][..d];
+                    for (oj, vj) in o.iter_mut().zip(v) {
+                        *oj += row[s] * vj;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Backward of `attn_fwd`; ACCUMULATES into `dqkv` (`[b,t,3c]`). Uses the stored `att`.
+pub fn attn_bwd(
+    dqkv: &mut [f32],
+    dout: &[f32],
+    qkv: &[f32],
+    att: &[f32],
+    b: usize,
+    t: usize,
+    c: usize,
+    h: usize,
+) {
+    let d = c / h;
+    let scale = 1.0 / (d as f32).sqrt();
+    let c3 = 3 * c;
+    let mut dp = vec![0.0f32; t];
+    for bi in 0..b {
+        for hi in 0..h {
+            for tq in 0..t {
+                let q_off = (bi * t + tq) * c3 + hi * d;
+                let do_ = &dout[(bi * t + tq) * c + hi * d..][..d];
+                let p = &att[((bi * h + hi) * t + tq) * t..][..t];
+                // dp[s] = dout . v_s ; dv_s += p[s] * dout
+                let mut pdp = 0.0;
+                for s in 0..=tq {
+                    let v_off = (bi * t + s) * c3 + 2 * c + hi * d;
+                    let mut acc = 0.0;
+                    for j in 0..d {
+                        acc += do_[j] * qkv[v_off + j];
+                        dqkv[v_off + j] += p[s] * do_[j];
+                    }
+                    dp[s] = acc;
+                    pdp += p[s] * acc;
+                }
+                // softmax Jacobian: ds = p * (dp - sum(p*dp)); scores = scale * q.k
+                for s in 0..=tq {
+                    let ds = p[s] * (dp[s] - pdp) * scale;
+                    let k_off = (bi * t + s) * c3 + c + hi * d;
+                    for j in 0..d {
+                        dqkv[q_off + j] += ds * qkv[k_off + j];
+                        dqkv[k_off + j] += ds * qkv[q_off + j];
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,5 +517,152 @@ mod tests {
         let loss = xent_fwd_bwd(&mut d, &logits, &targets, &[0.0; N], N, V);
         assert_eq!(loss, 0.0);
         assert!(d.iter().all(|v| *v == 0.0));
+    }
+
+    const AB: usize = 2;
+    const AT: usize = 5;
+    const AC: usize = 8;
+    const AH: usize = 2;
+
+    #[test]
+    fn rope_known_values() {
+        // b=1, t=2, h=1, d=4: position 0 is the identity; at position 1 pair 0
+        // rotates by 1 rad and pair 1 by 10000^(-1/2) = 0.01 rad.
+        let mut x = [1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0];
+        rope_fwd(&mut x, 1, 2, 1, 4);
+        assert_eq!(&x[..4], &[1.0, 0.0, 1.0, 0.0]);
+        assert!((x[4] - 1f32.cos()).abs() < 1e-6);
+        assert!((x[5] - 1f32.sin()).abs() < 1e-6);
+        assert!((x[6] - 0.01f32.cos()).abs() < 1e-6);
+        assert!((x[7] - 0.01f32.sin()).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rope_preserves_norm() {
+        let (b, t, h, d) = (2, 5, 2, 8);
+        let mut rng = Rng::new(10);
+        let x = randn(&mut rng, b * t * h * d);
+        let mut y = x.clone();
+        rope_fwd(&mut y, b, t, h, d);
+        for (xp, yp) in x.chunks(2).zip(y.chunks(2)) {
+            let n0 = xp[0] * xp[0] + xp[1] * xp[1];
+            let n1 = yp[0] * yp[0] + yp[1] * yp[1];
+            assert!((n0 - n1).abs() < 1e-4);
+        }
+        assert_ne!(x, y);
+    }
+
+    #[test]
+    fn rope_bwd_inverts() {
+        let (b, t, h, d) = (2, 5, 2, 8);
+        let mut rng = Rng::new(11);
+        let x = randn(&mut rng, b * t * h * d);
+        let mut y = x.clone();
+        rope_fwd(&mut y, b, t, h, d);
+        rope_bwd(&mut y, b, t, h, d);
+        for (a, c) in x.iter().zip(&y) {
+            assert!((a - c).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn rope_gradcheck() {
+        let (b, t, h, d) = (2, 5, 2, 8);
+        let mut rng = Rng::new(12);
+        let x = randn(&mut rng, b * t * h * d);
+        let r = randn(&mut rng, b * t * h * d);
+        let mut dx = r.clone();
+        rope_bwd(&mut dx, b, t, h, d);
+        let f = |x: &[f32]| {
+            let mut y = x.to_vec();
+            rope_fwd(&mut y, b, t, h, d);
+            wsum(&r, &y)
+        };
+        check(f, &x, &dx);
+    }
+
+    #[test]
+    fn attn_known_values_single_head() {
+        // b=1, t=2, c=2, h=1 (d=2): q=k=0 gives uniform causal attention.
+        // qkv rows: [q0 q1 | k0 k1 | v0 v1]
+        let qkv = [0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 0.0, 0.0, 0.0, 0.0, 3.0, 6.0];
+        let mut out = [9.0f32; 4];
+        let mut att = [9.0f32; 4];
+        attn_fwd(&mut out, &mut att, &qkv, 1, 2, 2, 1);
+        assert_eq!(att, [1.0, 0.0, 0.5, 0.5]);
+        assert_eq!(out, [1.0, 2.0, 2.0, 4.0]);
+    }
+
+    #[test]
+    fn attn_probs_causal_and_normalized() {
+        let mut rng = Rng::new(20);
+        let qkv = randn(&mut rng, AB * AT * 3 * AC);
+        let mut out = vec![0.0; AB * AT * AC];
+        let mut att = vec![7.0; AB * AH * AT * AT];
+        attn_fwd(&mut out, &mut att, &qkv, AB, AT, AC, AH);
+        for row in att.chunks(AT).enumerate() {
+            let (i, r) = row;
+            let tq = i % AT;
+            assert!((r.iter().sum::<f32>() - 1.0).abs() < 1e-5);
+            assert!(r[tq + 1..].iter().all(|p| *p == 0.0));
+            assert!(r[..=tq].iter().all(|p| *p > 0.0));
+        }
+    }
+
+    #[test]
+    fn attn_causal() {
+        let mut rng = Rng::new(21);
+        let qkv = randn(&mut rng, AB * AT * 3 * AC);
+        let mut out = vec![0.0; AB * AT * AC];
+        let mut att = vec![0.0; AB * AH * AT * AT];
+        attn_fwd(&mut out, &mut att, &qkv, AB, AT, AC, AH);
+        // Perturb every q/k/v value of token 3 in batch 0.
+        let mut qkv2 = qkv.clone();
+        for v in &mut qkv2[3 * 3 * AC..4 * 3 * AC] {
+            *v += 1.0;
+        }
+        let mut out2 = vec![0.0; AB * AT * AC];
+        let mut att2 = vec![0.0; AB * AH * AT * AT];
+        attn_fwd(&mut out2, &mut att2, &qkv2, AB, AT, AC, AH);
+        assert_eq!(&out[..3 * AC], &out2[..3 * AC]);
+        assert_ne!(&out[3 * AC..4 * AC], &out2[3 * AC..4 * AC]);
+        // Batch 1 is untouched.
+        assert_eq!(&out[AT * AC..], &out2[AT * AC..]);
+    }
+
+    #[test]
+    fn attn_gradcheck() {
+        let mut rng = Rng::new(22);
+        let qkv = randn(&mut rng, AB * AT * 3 * AC);
+        let r = randn(&mut rng, AB * AT * AC);
+        let mut out = vec![0.0; AB * AT * AC];
+        let mut att = vec![0.0; AB * AH * AT * AT];
+        attn_fwd(&mut out, &mut att, &qkv, AB, AT, AC, AH);
+        let mut dqkv = vec![0.0; qkv.len()];
+        attn_bwd(&mut dqkv, &r, &qkv, &att, AB, AT, AC, AH);
+        let f = |x: &[f32]| {
+            let mut o = vec![0.0; AB * AT * AC];
+            let mut a = vec![0.0; AB * AH * AT * AT];
+            attn_fwd(&mut o, &mut a, x, AB, AT, AC, AH);
+            wsum(&r, &o)
+        };
+        check(f, &qkv, &dqkv);
+    }
+
+    #[test]
+    fn attn_bwd_accumulates() {
+        let mut rng = Rng::new(23);
+        let qkv = randn(&mut rng, AB * AT * 3 * AC);
+        let r = randn(&mut rng, AB * AT * AC);
+        let mut out = vec![0.0; AB * AT * AC];
+        let mut att = vec![0.0; AB * AH * AT * AT];
+        attn_fwd(&mut out, &mut att, &qkv, AB, AT, AC, AH);
+        let mut d1 = vec![0.0; qkv.len()];
+        attn_bwd(&mut d1, &r, &qkv, &att, AB, AT, AC, AH);
+        let mut d2 = vec![1.0; qkv.len()];
+        attn_bwd(&mut d2, &r, &qkv, &att, AB, AT, AC, AH);
+        for (a, b) in d1.iter().zip(&d2) {
+            assert!((a + 1.0 - b).abs() < 1e-5);
+        }
     }
 }
