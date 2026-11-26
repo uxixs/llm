@@ -50,6 +50,31 @@ pub fn dialogue_views(turns: &[String]) -> Vec<Vec<String>> {
         .collect()
 }
 
+/// Documents from `a` and `b`, interleaved so that about `b_pct` percent of the bytes come
+/// from `b`, each source in its own order, up to `max_bytes` in total. The mix ends when
+/// the source it needs next runs out, so the ratio holds throughout.
+pub fn interleave<'a>(a: &[&'a str], b: &[&'a str], b_pct: u64, max_bytes: usize) -> Vec<&'a str> {
+    let (mut ia, mut ib, mut total, mut from_b) = (0usize, 0usize, 0usize, 0usize);
+    let mut out = Vec::new();
+    loop {
+        let take_b = b_pct > 0 && (from_b as u64) * 100 < b_pct * total as u64;
+        let doc = if take_b { b.get(ib) } else { a.get(ia) };
+        let Some(&doc) = doc else { break };
+        if total + doc.len() > max_bytes {
+            break;
+        }
+        if take_b {
+            ib += 1;
+            from_b += doc.len();
+        } else {
+            ia += 1;
+        }
+        total += doc.len();
+        out.push(doc);
+    }
+    out
+}
+
 /// A turn as people type it in a chat box: lowercase, no final period or exclamation mark
 /// ("How are you?" stays a question: "how are you?").
 pub fn casual(s: &str) -> String {
@@ -70,6 +95,25 @@ mod tests {
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn interleave_hits_ratio_and_limit() {
+        let a: Vec<String> = (0..5000).map(|i| format!("story {i} ").repeat(10)).collect();
+        let b: Vec<String> = (0..1000).map(|i| format!("wiki {i} ").repeat(20)).collect();
+        let (a, b): (Vec<&str>, Vec<&str>) = (a.iter().map(|s| s.as_str()).collect(), b.iter().map(|s| s.as_str()).collect());
+        let mixed = interleave(&a, &b, 20, 200_000);
+        let total: usize = mixed.iter().map(|d| d.len()).sum();
+        let wiki: usize = mixed.iter().filter(|d| d.starts_with("wiki")).map(|d| d.len()).sum();
+        assert!(total <= 200_000 && total > 190_000, "{total}");
+        let share = wiki as f64 / total as f64;
+        assert!((0.17..0.23).contains(&share), "wiki share {share}");
+        // documents stay in their source order
+        let firsts: Vec<&str> = mixed.iter().filter(|d| d.starts_with("story")).take(3).copied().collect();
+        assert_eq!(firsts, [a[0], a[1], a[2]]);
+        // 0% means only `a`; an exhausted source ends the mix early
+        assert!(interleave(&a, &b, 0, 50_000).iter().all(|d| d.starts_with("story")));
+        assert_eq!(interleave(&a[..2], &b, 50, usize::MAX).iter().filter(|d| d.starts_with("story")).count(), 2);
     }
 
     #[test]

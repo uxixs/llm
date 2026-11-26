@@ -3,14 +3,15 @@
 
 use rllm::rng::Rng;
 use rllm_prep::synth::{distractor_dialogue, filler_pool, identity_dialogue, memory_dialogue, TRAIN};
-use rllm_prep::tiny::{casualize_users, dialogue_views, parse_dialogue, split_stories};
+use rllm_prep::tiny::{casualize_users, dialogue_views, interleave, parse_dialogue, split_stories};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 const USAGE: &str = "usage: extract_tiny --stories <train.txt> --stories-val <valid.txt> \
 --dd-train <dialogues_train.txt> --dd-val <dialogues_validation.txt> [--out data-tiny] [--max-pretrain-mb 100] \
-[--synth-memory N] [--synth-identity N] [--synth-distractor N] [--casual-pct 0..100] [--seed 1]";
+[--synth-memory N] [--synth-identity N] [--synth-distractor N] [--casual-pct 0..100] [--seed 1] \
+[--mix <train.txt> --mix-val <val.txt> --mix-pct 0..100]";
 
 /// Counts of synthetic dialogues to append to the SFT training file.
 struct SynthCounts {
@@ -46,12 +47,28 @@ fn append_synth(dst: &Path, dd: &Path, n: &SynthCounts, casual_pct: u64, seed: u
 }
 const DOC_SEP: &str = "\n\x1e\n";
 
-fn write_stories(src: &Path, dst: &Path, max_bytes: usize) -> io::Result<(usize, usize)> {
-    let text = std::fs::read(src)?;
-    let text = String::from_utf8_lossy(&text);
+/// Writes stories from `src`, interleaved with `mix_pct` percent (by bytes) of documents
+/// from `mix` when given, up to `max_bytes`. Returns (documents, of them from `mix`, bytes).
+fn write_stories(
+    src: &Path,
+    mix: Option<&Path>,
+    mix_pct: u64,
+    dst: &Path,
+    max_bytes: usize,
+) -> io::Result<(usize, usize, usize)> {
+    let text = String::from_utf8_lossy(&std::fs::read(src)?).into_owned();
+    let extra = match mix {
+        Some(m) => String::from_utf8_lossy(&std::fs::read(m)?).into_owned(),
+        None => String::new(),
+    };
+    let a = split_stories(&text, true);
+    let b = split_stories(&extra, true);
+    // budget for the documents themselves; separators are added below
+    let docs = interleave(&a, &b, if mix.is_some() { mix_pct } else { 0 }, max_bytes.saturating_sub(a.len().min(1 << 20) * DOC_SEP.len()));
+    let b_set: std::collections::HashSet<*const u8> = b.iter().map(|d| d.as_ptr()).collect();
     let mut f = BufWriter::new(std::fs::File::create(dst)?);
-    let (mut n, mut bytes) = (0, 0);
-    for s in split_stories(&text, true) {
+    let (mut n, mut from_mix, mut bytes) = (0, 0, 0);
+    for s in docs {
         if bytes + s.len() > max_bytes {
             break;
         }
@@ -60,10 +77,11 @@ fn write_stories(src: &Path, dst: &Path, max_bytes: usize) -> io::Result<(usize,
         }
         f.write_all(s.as_bytes())?;
         n += 1;
+        from_mix += usize::from(b_set.contains(&s.as_ptr()));
         bytes += s.len() + DOC_SEP.len();
     }
     f.flush()?;
-    Ok((n, bytes))
+    Ok((n, from_mix, bytes))
 }
 
 /// `casual_pct` percent of the dialogue views get casual (lowercase, unpunctuated) user turns.
@@ -95,6 +113,7 @@ fn main() -> ExitCode {
     let mut out = PathBuf::from("data-tiny");
     let mut mb = 100usize;
     let (mut memory, mut identity, mut distractor, mut casual_pct, mut seed) = (0usize, 0usize, 0usize, 0u64, 1u64);
+    let (mut mix, mut mix_val, mut mix_pct) = (None::<PathBuf>, None::<PathBuf>, 0u64);
     let mut args = std::env::args().skip(1);
     while let Some(k) = args.next() {
         let Some(v) = args.next() else {
@@ -107,6 +126,15 @@ fn main() -> ExitCode {
             "--dd-train" => a[2] = Some(v.into()),
             "--dd-val" => a[3] = Some(v.into()),
             "--out" => out = v.into(),
+            "--mix" => mix = Some(v.into()),
+            "--mix-val" => mix_val = Some(v.into()),
+            "--mix-pct" => match v.parse::<u64>() {
+                Ok(n) => mix_pct = n.min(100),
+                Err(_) => {
+                    eprintln!("bad --mix-pct {v}");
+                    return ExitCode::from(2);
+                }
+            },
             "--max-pretrain-mb" | "--synth-memory" | "--synth-identity" | "--synth-distractor" | "--casual-pct"
             | "--seed" => match v.parse::<u64>() {
                 Ok(n) => match k.as_str() {
@@ -134,10 +162,14 @@ fn main() -> ExitCode {
     };
     let run = || -> io::Result<()> {
         std::fs::create_dir_all(&out)?;
-        let (n, b) = write_stories(&st, &out.join("pretrain_train.txt"), mb * 1024 * 1024)?;
-        println!("pretrain_train.txt: {n} stories, {:.1} MB", b as f64 / 1e6);
-        let (n, b) = write_stories(&sv, &out.join("pretrain_val.txt"), usize::MAX)?;
-        println!("pretrain_val.txt: {n} stories, {:.1} MB", b as f64 / 1e6);
+        if mix.is_some() != mix_val.is_some() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "--mix and --mix-val go together"));
+        }
+        let (n, m, b) = write_stories(&st, mix.as_deref(), mix_pct, &out.join("pretrain_train.txt"), mb * 1024 * 1024)?;
+        println!("pretrain_train.txt: {n} documents ({m} mixed in), {:.1} MB", b as f64 / 1e6);
+        // validation uses the same mix, so its loss covers both kinds of text
+        let (n, m, b) = write_stories(&sv, mix_val.as_deref(), mix_pct, &out.join("pretrain_val.txt"), usize::MAX)?;
+        println!("pretrain_val.txt: {n} documents ({m} mixed in), {:.1} MB", b as f64 / 1e6);
         // validation stays as written, so its loss compares with earlier runs
         let mut rng = Rng::new(seed.wrapping_add(7));
         for (src, split, pct) in [(&dt, "train", casual_pct), (&dv, "val", 0)] {
