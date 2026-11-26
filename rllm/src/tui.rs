@@ -388,6 +388,8 @@ pub enum Command {
     Quit,
     Temp(f32),
     TopP(f32),
+    /// Reply pace in tokens per second (0 = no limit).
+    Speed(f64),
     Model(String),
     /// Reopen the model picker.
     Models,
@@ -421,6 +423,11 @@ pub fn parse_command(line: &str) -> Command {
         "/quit" | "/exit" => Command::Quit,
         "/temp" => match one_float("/temp", |v| (0.0..=5.0).contains(&v), "0..5") {
             Ok(v) => Command::Temp(v),
+            Err(e) => Command::Invalid(e),
+        },
+        "/speed" if rest == "off" || rest == "max" => Command::Speed(0.0),
+        "/speed" => match one_float("/speed", |v| (0.0..=1000.0).contains(&v), "0..1000") {
+            Ok(v) => Command::Speed(v as f64),
             Err(e) => Command::Invalid(e),
         },
         "/top_p" => match one_float("/top_p", |v| v > 0.0 && v <= 1.0, "(0, 1]") {
@@ -528,6 +535,7 @@ const HELP: &str = "\
 /reset         clear the conversation
 /temp X        sampling temperature, 0..5 (0 = greedy)
 /top_p X       nucleus sampling, (0, 1]
+/speed N       show replies at N tokens per second (0 or off = as fast as possible)
 /models        back to the model list to switch models
 /model PATH    load another model.bin (its folder's tokenizer if it has one)
 /quit, /exit   leave (also Ctrl+C at the prompt, or Ctrl+Z then Enter)
@@ -1056,11 +1064,13 @@ impl Chat {
         write!(out, "{} ", style.accent("●"))?;
         out.flush()?;
         let mut wrap = Wrap::new(line_width(style), 2, 2);
+        let mut pacer = Pacer::new(self.args.pace);
         let (params, cfg, be) = (&self.params, &self.cfg, self.args.backend);
         let cache = &mut self.cache;
         let mut stepper = |tok: u16, pos: usize| step(params, cfg, be, cache, tok, pos);
         let (reply, secs) = {
             let mut emit = |s: &str| {
+                pacer.wait(cancel);
                 if style.color {
                     // erase the last preview, print what is settled, then show the word still
                     // being generated in red and step back over it (it is redrawn next time)
@@ -1095,9 +1105,51 @@ impl Chat {
             writeln!(out, "{}", note(style, "Interrupted", true))?;
         }
         let used = prompt.len() + reply.len();
-        writeln!(out, "  {}\n", style.dim(&fmt_footer(reply.len(), secs, used, self.cfg.ctx)))?;
+        // the footer shows the model's own speed: time spent pacing is left out
+        let model_secs = (secs - pacer.slept.as_secs_f64()).max(0.0);
+        let mut footer = fmt_footer(reply.len(), model_secs, used, self.cfg.ctx);
+        if self.args.pace > 0.0 {
+            footer.push_str(&format!(" · shown at {} tok/s", self.args.pace));
+        }
+        writeln!(out, "  {}\n", style.dim(&footer))?;
         self.history.push((user, reply));
         Ok(())
+    }
+}
+
+/// Holds streamed text back to a readable pace: the k-th piece is released no earlier than
+/// k / `pace` seconds after the first. `pace` 0 never waits. Waits in short slices so a
+/// Ctrl+C (`cancel`) cuts it short.
+pub struct Pacer {
+    pace: f64,
+    start: Option<std::time::Instant>,
+    n: u32,
+    /// Total time spent waiting.
+    pub slept: std::time::Duration,
+}
+
+impl Pacer {
+    pub fn new(pace: f64) -> Pacer {
+        Pacer { pace, start: None, n: 0, slept: std::time::Duration::ZERO }
+    }
+
+    pub fn wait(&mut self, cancel: &AtomicBool) {
+        if !(self.pace > 0.0) {
+            return;
+        }
+        let start = *self.start.get_or_insert_with(std::time::Instant::now);
+        let due = start + std::time::Duration::from_secs_f64(self.n as f64 / self.pace);
+        self.n += 1;
+        let t0 = std::time::Instant::now();
+        loop {
+            let now = std::time::Instant::now();
+            if now >= due || cancel.load(Relaxed) {
+                break;
+            }
+            std::thread::sleep((due - now).min(std::time::Duration::from_millis(20)));
+        }
+        // measured, not requested: OS sleeps overshoot, and the footer subtracts this
+        self.slept += t0.elapsed();
     }
 }
 
@@ -1109,8 +1161,9 @@ fn draw_input_box(out: &mut dyn Write, style: &Style, chat: &Chat) -> std::io::R
     }
     let w = line_width(style);
     let rule = style.line(&"─".repeat(w));
+    let speed = if chat.args.pace > 0.0 { format!("{} tok/s", chat.args.pace) } else { "max speed".to_string() };
     let hint = style.dim(&format!(
-        "  /help for commands · Ctrl+C stops a reply · temp {:.2} · top_p {:.2}",
+        "  /help for commands · Ctrl+C stops a reply · temp {:.2} · top_p {:.2} · {speed}",
         chat.args.temp, chat.args.top_p
     ));
     // rule / empty prompt row / rule / hint, then back up to the prompt row.
@@ -1196,6 +1249,11 @@ pub fn run_tui(
             Command::Reset => {
                 chat.history.clear();
                 say(out, "new conversation", false).map_err(io)?;
+            }
+            Command::Speed(v) => {
+                chat.args.pace = v;
+                let msg = if v > 0.0 { format!("replies shown at {v} tokens per second") } else { "replies shown as fast as the model runs".into() };
+                say(out, &msg, false).map_err(io)?;
             }
             Command::Temp(v) => {
                 chat.args.temp = v;
@@ -1287,6 +1345,11 @@ mod tests {
             assert!(matches!(parse_command(bad), Command::Invalid(_)), "{bad}");
         }
         assert_eq!(parse_command("/models"), Command::Models);
+        assert_eq!(parse_command("/speed 25"), Command::Speed(25.0));
+        assert_eq!(parse_command("/speed 0"), Command::Speed(0.0));
+        assert_eq!(parse_command("/speed off"), Command::Speed(0.0));
+        assert!(matches!(parse_command("/speed -3"), Command::Invalid(_)));
+        assert!(matches!(parse_command("/speed"), Command::Invalid(_)));
         assert_eq!(parse_command("/frobnicate 1"), Command::Unknown("/frobnicate".into()));
         assert_eq!(parse_command("hello there"), Command::Text("hello there".into()));
         assert_eq!(parse_command("  안녕  "), Command::Text("안녕".into()));
@@ -1643,6 +1706,45 @@ mod tests {
     }
 
     #[test]
+    fn pacer_holds_pieces_to_the_pace() {
+        let never = AtomicBool::new(false);
+        let mut p = Pacer::new(100.0); // 10 ms per piece
+        let t = std::time::Instant::now();
+        for _ in 0..11 {
+            p.wait(&never);
+        }
+        let el = t.elapsed().as_secs_f64();
+        assert!(el >= 0.095, "11 pieces at 100/s take at least 100 ms, took {el}");
+        assert!(p.slept.as_secs_f64() > 0.05);
+        // pace 0: no waiting at all
+        let mut p = Pacer::new(0.0);
+        let t = std::time::Instant::now();
+        for _ in 0..100 {
+            p.wait(&never);
+        }
+        assert!(t.elapsed().as_secs_f64() < 0.05 && p.slept.is_zero());
+        // a set cancel flag stops the wait right away
+        let mut p = Pacer::new(1.0);
+        p.wait(&never);
+        let t = std::time::Instant::now();
+        p.wait(&AtomicBool::new(true));
+        assert!(t.elapsed().as_secs_f64() < 0.1);
+    }
+
+    #[test]
+    fn paced_turn_footer_reports_model_speed() {
+        let (dir, model, tok) = tiny_files("paced", 9);
+        let mut a = args(model, tok);
+        a.pace = 200.0;
+        let mut chat = Chat::load(a).unwrap();
+        let mut out = Vec::new();
+        chat.turn(&mut out, &Style { color: false }, "hello", &AtomicBool::new(false)).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("shown at 200 tok/s"), "{out}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn footer_format() {
         assert_eq!(fmt_footer(12, 0.5, 40, 256), "⎿  12 tok · 24.0 tok/s · ctx 40/256");
         assert_eq!(fmt_footer(0, 0.0, 7, 256), "⎿  0 tok · 0.0 tok/s · ctx 7/256");
@@ -1720,6 +1822,7 @@ mod tests {
             batch: None,
             seed: 1,
             threads: 4,
+            pace: 0.0,
         }
     }
 

@@ -73,6 +73,7 @@ fn main() -> ExitCode {
             batch: None,
             seed: 1,
             threads: 4,
+            pace: 0.0, // tests run at full speed
         };
         let mut chat = Chat::load(args)?;
         let text = std::fs::read_to_string(&dd).map_err(|e| format!("{}: {e}", dd.display()))?;

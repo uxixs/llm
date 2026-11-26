@@ -281,9 +281,15 @@ pub struct ChatArgs {
     pub seed: u64,
     /// Pool size for `--backend avx512mt` (default 4).
     pub threads: usize,
+    /// Interactive chat streams replies at most this many tokens per second, so text
+    /// appears at a readable pace; 0 = as fast as the model runs. Batch mode ignores it.
+    pub pace: f64,
 }
 
-pub const CHAT_USAGE: &str = "usage: chat --model runs/<run>/model.bin [--tokenizer data/tokenizer.bin] [--backend scalar|blocked|avx512|avx512mt|asm] [--temp 0.8] [--top-p 0.9] [--kernel fp32|ternary] [--batch questions.txt] [--seed 1] [--threads 4]";
+/// Default reply pace for the interactive chat, in tokens per second.
+pub const DEFAULT_PACE: f64 = 40.0;
+
+pub const CHAT_USAGE: &str = "usage: chat --model runs/<run>/model.bin [--tokenizer data/tokenizer.bin] [--backend scalar|blocked|avx512|avx512mt|asm] [--temp 0.8] [--top-p 0.9] [--kernel fp32|ternary] [--batch questions.txt] [--seed 1] [--threads 4] [--pace 40 (tokens/s, 0 = no limit)]";
 
 impl ChatArgs {
     pub fn parse(mut it: impl Iterator<Item = String>) -> Result<ChatArgs, String> {
@@ -297,6 +303,7 @@ impl ChatArgs {
             batch: None,
             seed: 1,
             threads: 4,
+            pace: DEFAULT_PACE,
         };
         let mut have_model = false;
         fn num<T: std::str::FromStr>(f: &str, v: Option<String>) -> Result<T, String> {
@@ -315,6 +322,12 @@ impl ChatArgs {
                 "--top-p" => a.top_p = num(&f, it.next())?,
                 "--seed" => a.seed = num(&f, it.next())?,
                 "--threads" => a.threads = num(&f, it.next())?,
+                "--pace" => {
+                    a.pace = num(&f, it.next())?;
+                    if !(a.pace >= 0.0 && a.pace.is_finite()) {
+                        return Err("--pace must be a number >= 0 (tokens per second, 0 = no limit)".into());
+                    }
+                }
                 "--batch" => a.batch = Some(it.next().ok_or("--batch needs a value")?.into()),
                 "--kernel" => {
                     a.kernel = match it.next().as_deref() {
@@ -770,6 +783,7 @@ mod tests {
             batch: None,
             seed: 1,
             threads: 4,
+            pace: 0.0,
         }
     }
 
