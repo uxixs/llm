@@ -533,42 +533,20 @@ const HELP: &str = "\
 /quit, /exit   leave (also Ctrl+C at the prompt, or Ctrl+Z then Enter)
 Ctrl+C while the assistant is replying stops that reply.";
 
-/// City ladder from small but well-known (often for culture) to the megacities everyone
-/// knows. Weaker models get names from the bottom, stronger ones from the top.
-pub const CITIES: &[&str] = &[
-    "Bruges", "Salzburg", "Cusco", "Reykjavik", "Marrakech", "Edinburgh", "Florence", "Venice",
-    "Kyoto", "Prague", "Vienna", "Amsterdam", "Barcelona", "Sydney", "Dubai", "Rome", "Hong Kong",
-    "Singapore", "Los Angeles", "Shanghai", "London", "Paris", "Seoul", "Tokyo", "New York",
+/// Size tiers: the city says how much a model was trained, the way a model family's tier
+/// names say how big its models are. (most training seconds, city); the last has no limit.
+pub const TIERS: &[(f64, &str)] = &[
+    (360.0, "Bruges"),    // up to ~5 minutes
+    (1500.0, "Kyoto"),    // up to ~20 minutes
+    (5400.0, "Seoul"),    // up to ~1 hour
+    (21600.0, "New York"), // up to a night (6 h)
+    (f64::INFINITY, "Atlantis"),
 ];
 
-/// City for overall rank `r` (0 = worst) out of `n` runs. Ranks are spread over the whole
-/// ladder, so the worst run is always the first city and the best is always the last; past
-/// the ladder's length names repeat with a number.
-pub fn city_for_rank(r: usize, n: usize) -> String {
-    let len = CITIES.len();
-    if n > len {
-        // more runs than cities: climb one step per rank, repeating with a number
-        let base = CITIES[r * len / n];
-        let k = (0..r).filter(|&q| q * len / n == r * len / n).count();
-        return if k == 0 { base.to_string() } else { format!("{base} {}", k + 1) };
-    }
-    let i = if n <= 1 { len - 1 } else { (r * (len - 1) + (n - 1) / 2) / (n - 1) };
-    CITIES[i.min(len - 1)].to_string()
-}
-
-/// Overall rank of each run from its `major.minor` version: worst (lowest) is 0.
-pub fn overall_ranks(versions: &[String]) -> Vec<usize> {
-    let key = |v: &str| {
-        let (a, b) = v.split_once('.').unwrap_or((v, "0"));
-        (a.parse::<u32>().unwrap_or(0), b.parse::<u32>().unwrap_or(0))
-    };
-    let mut order: Vec<usize> = (0..versions.len()).collect();
-    order.sort_by_key(|&i| key(&versions[i]));
-    let mut rank = vec![0; versions.len()];
-    for (r, i) in order.into_iter().enumerate() {
-        rank[i] = r;
-    }
-    rank
+/// Tier city for a run trained for `wall_s` seconds (unknown counts as the smallest).
+pub fn tier_for(wall_s: Option<f64>) -> &'static str {
+    let w = wall_s.unwrap_or(0.0);
+    TIERS.iter().find(|(max, _)| w <= *max).map_or("Atlantis", |t| t.1)
 }
 
 /// City name and version of the run that holds `model`, looked up among its sibling runs.
@@ -580,26 +558,15 @@ pub fn run_title(model: &Path) -> Option<(String, String)> {
 /// What `assign_versions` needs to know about one run.
 #[derive(Clone, Copy, Debug)]
 pub struct VersionInput {
-    /// Runs with the same key share a tokenizer, so their losses can be compared.
+    /// Runs with the same key share a tokenizer (one data generation).
     pub family: u64,
     pub age_s: u64,
-    pub val_pre: Option<f64>,
-    pub val_sft: Option<f64>,
 }
 
-/// `major.minor` per run. Major numbers the families (same tokenizer) in order of their
-/// oldest run, from 1. Minor ranks the runs of a family by mean validation loss: the worst
-/// is `.0`, better runs get higher numbers. A run without losses ranks last; ties go to the
-/// older run first.
+/// `generation.release` per run. Generation numbers the families (same tokenizer) in order
+/// of their oldest run, from 1; release numbers a family's runs by age, oldest `.0`. Both
+/// depend only on when runs were made, so a name never changes once given.
 pub fn assign_versions(runs: &[VersionInput]) -> Vec<String> {
-    let score = |r: &VersionInput| {
-        let v: Vec<f64> = [r.val_pre, r.val_sft].into_iter().flatten().collect();
-        if v.is_empty() {
-            f64::INFINITY
-        } else {
-            v.iter().sum::<f64>() / v.len() as f64
-        }
-    };
     let mut families: Vec<(u64, u64)> = Vec::new(); // (family, oldest age)
     for r in runs {
         match families.iter_mut().find(|f| f.0 == r.family) {
@@ -609,17 +576,33 @@ pub fn assign_versions(runs: &[VersionInput]) -> Vec<String> {
     }
     families.sort_by(|a, b| b.1.cmp(&a.1)); // oldest first
     let mut out = vec![String::new(); runs.len()];
-    for (fi, (fam, _)) in families.iter().enumerate() {
+    for (gi, (fam, _)) in families.iter().enumerate() {
         let mut members: Vec<usize> = (0..runs.len()).filter(|&i| runs[i].family == *fam).collect();
-        // worst first: highest loss, then older
-        members.sort_by(|&a, &b| {
-            score(&runs[b]).total_cmp(&score(&runs[a])).then(runs[b].age_s.cmp(&runs[a].age_s))
-        });
-        for (minor, i) in members.into_iter().enumerate() {
-            out[i] = format!("{}.{minor}", fi + 1);
+        members.sort_by(|&a, &b| runs[b].age_s.cmp(&runs[a].age_s)); // oldest first
+        for (release, i) in members.into_iter().enumerate() {
+            out[i] = format!("{}.{release}", gi + 1);
         }
     }
     out
+}
+
+/// Mean of the recorded validation losses (None if there are none).
+fn mean_loss(r: &RunInfo) -> Option<f64> {
+    let v: Vec<f64> = [r.val_pre, r.val_sft].into_iter().flatten().collect();
+    (!v.is_empty()).then(|| v.iter().sum::<f64>() / v.len() as f64)
+}
+
+/// Marks, per generation, the run with the lowest mean validation loss (weak runs never).
+pub fn mark_best(runs: &mut [RunInfo]) {
+    let gens: Vec<String> = runs.iter().map(|r| r.version.split('.').next().unwrap_or("").to_string()).collect();
+    for g in gens.iter().collect::<std::collections::HashSet<_>>() {
+        let best = (0..runs.len())
+            .filter(|&i| &gens[i] == g && !is_weak(&runs[i]))
+            .min_by(|&a, &b| mean_loss(&runs[a]).unwrap_or(f64::INFINITY).total_cmp(&mean_loss(&runs[b]).unwrap_or(f64::INFINITY)));
+        if let Some(i) = best {
+            runs[i].best = true;
+        }
+    }
 }
 
 /// FNV-1a of a file's bytes (0 if unreadable).
@@ -630,11 +613,11 @@ fn file_key(path: &Path) -> u64 {
 }
 
 /// One trained run under `runs/`, for the startup picker.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct RunInfo {
-    /// Codename shown to the user (falls back to the folder name).
+    /// Tier city shown to the user (see `TIERS`).
     pub codename: String,
-    /// Performance version, e.g. "2.3" (see `assign_versions`).
+    /// `generation.release`, e.g. "2.4" (see `assign_versions`).
     pub version: String,
     pub name: String,
     pub model: PathBuf,
@@ -642,22 +625,30 @@ pub struct RunInfo {
     pub age_s: u64,
     pub val_pre: Option<f64>,
     pub val_sft: Option<f64>,
+    /// Training time from `results.csv`.
+    pub wall_s: Option<f64>,
+    /// Lowest mean validation loss in its generation.
+    pub best: bool,
 }
 
-/// Runs with a `model.bin`, newest first, with validation losses from `results.csv`
-/// (the last row for a name wins), each with its version and city name.
+/// Runs with a `model.bin`, newest first, with validation losses and training time from
+/// `results.csv` (the last row for a name wins), each with its tier city, version and
+/// best-of-generation mark.
 pub fn list_runs(dir: &Path) -> Vec<RunInfo> {
-    let mut losses = std::collections::HashMap::new();
+    let mut stats = std::collections::HashMap::new();
     if let Ok(csv) = std::fs::read_to_string(dir.join("results.csv")) {
         let mut lines = csv.lines();
         let header: Vec<&str> = lines.next().unwrap_or("").split(',').collect();
         let col = |n: &str| header.iter().position(|h| *h == n);
-        if let (Some(ni), Some(pi), Some(si)) = (col("name"), col("val_loss_pretrain"), col("val_loss_sft")) {
+        if let Some(ni) = col("name") {
+            let (pi, si, wi) = (col("val_loss_pretrain"), col("val_loss_sft"), col("wall_s"));
             for l in lines {
                 let f: Vec<&str> = l.split(',').collect();
-                let num = |i: usize| f.get(i).and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite());
+                let num = |i: Option<usize>| {
+                    i.and_then(|i| f.get(i)).and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite())
+                };
                 if let Some(n) = f.get(ni) {
-                    losses.insert(n.to_string(), (num(pi), num(si)));
+                    stats.insert(n.to_string(), (num(pi), num(si), num(wi)));
                 }
             }
         }
@@ -671,30 +662,22 @@ pub fn list_runs(dir: &Path) -> Vec<RunInfo> {
             let model = e.path().join("model.bin");
             let t = std::fs::metadata(&model).ok()?.modified().ok()?;
             let name = e.file_name().to_string_lossy().into_owned();
-            let (val_pre, val_sft) = losses.get(&name).copied().unwrap_or((None, None));
+            let (val_pre, val_sft, wall_s) = stats.get(&name).copied().unwrap_or((None, None, None));
             let age_s = now.duration_since(t).map(|d| d.as_secs()).unwrap_or(0);
-            let (codename, version) = (String::new(), String::new());
-            Some((t, RunInfo { codename, version, name, model, age_s, val_pre, val_sft }))
+            let codename = tier_for(wall_s).to_string();
+            Some((t, RunInfo { codename, name, model, age_s, val_pre, val_sft, wall_s, ..Default::default() }))
         })
         .collect();
     runs.sort_by(|a, b| b.0.cmp(&a.0));
     let mut runs: Vec<RunInfo> = runs.into_iter().map(|(_, r)| r).collect();
     let inputs: Vec<VersionInput> = runs
         .iter()
-        .map(|r| VersionInput {
-            family: file_key(&r.model.with_file_name("tokenizer.bin")),
-            age_s: r.age_s,
-            val_pre: r.val_pre,
-            val_sft: r.val_sft,
-        })
+        .map(|r| VersionInput { family: file_key(&r.model.with_file_name("tokenizer.bin")), age_s: r.age_s })
         .collect();
-    let versions = assign_versions(&inputs);
-    let ranks = overall_ranks(&versions);
-    let n = runs.len();
-    for ((r, v), k) in runs.iter_mut().zip(versions).zip(ranks) {
+    for (r, v) in runs.iter_mut().zip(assign_versions(&inputs)) {
         r.version = v;
-        r.codename = city_for_rank(k, n);
     }
+    mark_best(&mut runs);
     runs
 }
 
@@ -738,7 +721,14 @@ fn subset(runs: &[RunInfo], idx: &[usize]) -> Vec<RunInfo> {
 
 /// One line per run, the selected one marked with a red `❯` and its name in bold.
 pub fn fmt_run_rows(style: &Style, runs: &[RunInfo], sel: usize) -> String {
-    let title = |r: &RunInfo| if r.version.is_empty() { r.codename.clone() } else { format!("{} {}", r.codename, r.version) };
+    let title = |r: &RunInfo| {
+        let star = if r.best { " ★" } else { "" };
+        if r.version.is_empty() {
+            format!("{}{star}", r.codename)
+        } else {
+            format!("{} {}{star}", r.codename, r.version)
+        }
+    };
     let wcode = runs.iter().map(|r| str_width(&title(r))).max().unwrap_or(0);
     let wname = runs.iter().map(|r| str_width(&r.name)).max().unwrap_or(0);
     let loss = |v: Option<f64>| v.map_or("  -  ".to_string(), |v| format!("{v:.2}"));
@@ -1336,7 +1326,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("no-model")).unwrap();
         std::fs::write(
             dir.join("results.csv"),
-            "timestamp,name,val_loss_pretrain,val_loss_sft\n1,new,9.0,9.0\n2,new,3.13,3.78\n3,old,NaN,4.5\n",
+            "timestamp,name,val_loss_pretrain,val_loss_sft,wall_s\n1,new,9.0,9.0,1200\n2,new,3.13,3.78,1199.5\n3,old,NaN,4.5,3599\n",
         )
         .unwrap();
         let runs = list_runs(&dir);
@@ -1347,45 +1337,47 @@ mod tests {
         assert_eq!((runs[2].val_pre, runs[2].val_sft), (None, Some(4.5)), "NaN shown as missing");
         assert_eq!(runs[0].model, dir.join("new").join("model.bin"));
         assert!(list_runs(&dir.join("nope")).is_empty());
-        // no tokenizer files: one family; "mid" has no losses so it ranks worst,
-        // then old (4.5), then new (3.455) is best
-        let titles: Vec<String> = runs.iter().map(|r| format!("{} {}", r.codename, r.version)).collect();
-        assert_eq!(titles, ["New York 1.2", "Bruges 1.0", "Barcelona 1.1"]);
+        // no tokenizer files: one generation; releases by age (old .0, mid .1, new .2);
+        // tier by training time; "new" (mean 3.455) is the best non-weak run
+        let titles: Vec<String> = runs
+            .iter()
+            .map(|r| format!("{} {}{}", r.codename, r.version, if r.best { " ★" } else { "" }))
+            .collect();
+        assert_eq!(titles, ["Kyoto 1.2 ★", "Bruges 1.1", "Seoul 1.0"]);
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
-    fn versions_by_family_and_loss() {
-        let v = |family, age_s, pre, sft| VersionInput { family, age_s, val_pre: pre, val_sft: sft };
-        let runs = [
-            v(7, 500, Some(7.5), None),       // reddit, oldest overall
-            v(7, 400, Some(4.0), Some(3.7)),  // reddit, best of its family
-            v(9, 300, Some(5.1), Some(3.1)),  // tiny, mean 4.1
-            v(9, 200, Some(2.5), Some(3.2)),  // tiny, mean 2.85 = best
-            v(9, 100, None, None),            // tiny, no losses = worst
-            v(7, 50, Some(6.0), Some(6.0)),   // reddit, newer but worse
-        ];
-        let got = assign_versions(&runs);
-        assert_eq!(got, ["1.0", "1.2", "2.1", "2.2", "2.0", "1.1"]);
-        let ranks = overall_ranks(&got);
-        assert_eq!(ranks, [0, 2, 4, 5, 3, 1]);
-        // worst is always the smallest city, best always New York, whatever the count
-        for n in [1usize, 2, 3, 9, 25] {
-            let names: Vec<String> = (0..n).map(|r| city_for_rank(r, n)).collect();
-            assert_eq!(names.last().unwrap(), "New York", "n={n}");
-            if n > 1 {
-                assert_eq!(names[0], "Bruges", "n={n}");
-            }
-            let set: std::collections::HashSet<&String> = names.iter().collect();
-            assert_eq!(set.len(), n, "names unique for n={n}: {names:?}");
-        }
-        // more runs than cities: still unique and still climbing
-        let names: Vec<String> = (0..60).map(|r| city_for_rank(r, 60)).collect();
-        let set: std::collections::HashSet<&String> = names.iter().collect();
-        assert_eq!(set.len(), 60);
-        assert!(names[0].starts_with("Bruges") && names[59].starts_with("New York"), "{names:?}");
-        let all: std::collections::HashSet<&str> = CITIES.iter().copied().collect();
-        assert_eq!(all.len(), CITIES.len(), "no duplicate cities");
+    fn versions_by_generation_and_release() {
+        let v = |family, age_s| VersionInput { family, age_s };
+        let runs = [v(7, 500), v(7, 400), v(9, 300), v(9, 200), v(9, 100), v(7, 50)];
+        // generation by oldest run of each family, release by age within it
+        assert_eq!(assign_versions(&runs), ["1.0", "1.1", "2.0", "2.1", "2.2", "1.2"]);
+        // a newer run never changes existing versions
+        let mut more = runs.to_vec();
+        more.push(v(9, 10));
+        assert_eq!(&assign_versions(&more)[..6], &assign_versions(&runs)[..]);
+        assert_eq!(assign_versions(&more)[6], "2.3");
+    }
+
+    #[test]
+    fn tiers_by_training_time() {
+        assert_eq!(tier_for(Some(47.0)), "Bruges");
+        assert_eq!(tier_for(Some(300.0)), "Bruges");
+        assert_eq!(tier_for(Some(1199.8)), "Kyoto");
+        assert_eq!(tier_for(Some(3600.0)), "Seoul");
+        assert_eq!(tier_for(Some(8.0 * 3600.0)), "Atlantis");
+        assert_eq!(tier_for(Some(5.0 * 3600.0)), "New York");
+        assert_eq!(tier_for(None), "Bruges");
+    }
+
+    #[test]
+    fn best_marked_per_generation() {
+        let mk = |v: &str, pre: f64, sft: f64| RunInfo { version: v.into(), val_pre: Some(pre), val_sft: Some(sft), ..Default::default() };
+        let mut runs = vec![mk("1.0", 7.5, 7.0), mk("1.1", 4.0, 3.7), mk("2.0", 2.5, 3.2), mk("2.1", 2.4, 3.1), mk("2.2", 6.3, 6.9)];
+        mark_best(&mut runs);
+        let best: Vec<bool> = runs.iter().map(|r| r.best).collect();
+        assert_eq!(best, [false, true, false, true, false]);
     }
 
     #[test]
@@ -1439,9 +1431,9 @@ mod tests {
 
     fn two_runs() -> Vec<RunInfo> {
         vec![
-            RunInfo { codename: "Cairo".into(), version: "1.2".into(), name: "a".into(), model: "runs/a/model.bin".into(), age_s: 1, val_pre: None, val_sft: None },
-            RunInfo { codename: "Busan".into(), version: "1.1".into(), name: "b".into(), model: "runs/b/model.bin".into(), age_s: 2, val_pre: None, val_sft: None },
-            RunInfo { codename: "Amsterdam".into(), version: "1.0".into(), name: "c".into(), model: "runs/c/model.bin".into(), age_s: 3, val_pre: None, val_sft: None },
+            RunInfo { codename: "Cairo".into(), version: "1.2".into(), name: "a".into(), model: "runs/a/model.bin".into(), age_s: 1, val_pre: None, val_sft: None, wall_s: None, best: false },
+            RunInfo { codename: "Busan".into(), version: "1.1".into(), name: "b".into(), model: "runs/b/model.bin".into(), age_s: 2, val_pre: None, val_sft: None, wall_s: None, best: false },
+            RunInfo { codename: "Amsterdam".into(), version: "1.0".into(), name: "c".into(), model: "runs/c/model.bin".into(), age_s: 3, val_pre: None, val_sft: None, wall_s: None, best: false },
         ]
     }
 
@@ -1454,6 +1446,7 @@ mod tests {
             age_s: 1,
             val_pre: pre,
             val_sft: sft,
+            ..Default::default()
         }
     }
 
@@ -1525,8 +1518,8 @@ mod tests {
     #[test]
     fn picker_menu_and_retry() {
         let runs = vec![
-            RunInfo { codename: "Istanbul".into(), version: "2.4".into(), name: "tiny-mem".into(), model: "runs/tiny-mem/model.bin".into(), age_s: 90, val_pre: Some(2.56), val_sft: Some(3.2) },
-            RunInfo { codename: "Dublin".into(), version: "1.3".into(), name: "reddit".into(), model: "runs/reddit/model.bin".into(), age_s: 7200, val_pre: Some(4.03), val_sft: Some(3.75) },
+            RunInfo { codename: "Istanbul".into(), version: "2.4".into(), name: "tiny-mem".into(), model: "runs/tiny-mem/model.bin".into(), age_s: 90, val_pre: Some(2.56), val_sft: Some(3.2), wall_s: None, best: false },
+            RunInfo { codename: "Dublin".into(), version: "1.3".into(), name: "reddit".into(), model: "runs/reddit/model.bin".into(), age_s: 7200, val_pre: Some(4.03), val_sft: Some(3.75), wall_s: None, best: false },
         ];
         let s = Style { color: false };
         let menu = fmt_run_menu(&s, &runs);
